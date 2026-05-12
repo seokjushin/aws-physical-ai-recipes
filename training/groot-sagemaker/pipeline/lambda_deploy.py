@@ -8,6 +8,7 @@ Model Registry의 최신 승인 모델로 엔드포인트를 생성/업데이트
     endpoint_name:       생성/업데이트할 엔드포인트 이름
     instance_type:       추론 인스턴스 타입
     role_arn:            SageMaker 실행 역할 ARN
+    alias (선택):         리소스 이름 postfix
 """
 
 import time
@@ -43,7 +44,8 @@ def handler(event, context):
 
     model_package_arn = packages[0]["ModelPackageArn"]
     timestamp = int(time.time())
-    model_name = f"groot-n16-{timestamp}"
+    # endpoint_name 자체가 alias postfix를 포함하므로 model_name에도 자연 반영
+    model_name = f"{endpoint_name}-model-{timestamp}"
     config_name = f"{endpoint_name}-{timestamp}"
 
     # 2. SageMaker Model 생성 (Model Package 참조)

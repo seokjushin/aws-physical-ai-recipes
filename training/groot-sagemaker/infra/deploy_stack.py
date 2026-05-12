@@ -6,9 +6,14 @@ CloudFormation 스택을 배포하여 필요한 모든 AWS 리소스를 생성�
 
 사용법:
     python infra/deploy_stack.py \
-        --stack-name groot-n16-stack \
         --bucket-name my-groot-artifacts-20240101 \
-        --region ap-northeast-2
+        --region us-east-1
+
+    # 멀티 사용자/환경: --alias로 모든 리소스 이름에 postfix 추가
+    python infra/deploy_stack.py \
+        --alias alice \
+        --bucket-name my-groot-artifacts-20240101-alice \
+        --region us-east-1
 """
 
 import argparse
@@ -36,6 +41,7 @@ def deploy_stack(
     stack_name: str,
     bucket_name: str,
     region: str,
+    alias: str = "",
     role_name: str = "GR00TSageMakerRole",
     repository_url: str = "",
 ) -> dict:
@@ -45,6 +51,7 @@ def deploy_stack(
         stack_name: CloudFormation 스택 이름.
         bucket_name: S3 버킷 이름 (전 세계 고유해야 함).
         region: AWS 리전.
+        alias: 리소스 이름 충돌 방지용 postfix (선택).
         role_name: SageMaker 실행 역할 이름.
         repository_url: CodeBuild 소스 GitHub URL (선택).
 
@@ -59,6 +66,7 @@ def deploy_stack(
 
     parameters = [
         {"ParameterKey": "BucketName", "ParameterValue": bucket_name},
+        {"ParameterKey": "Alias", "ParameterValue": alias},
         {"ParameterKey": "RoleName", "ParameterValue": role_name},
         {"ParameterKey": "RepositoryUrl", "ParameterValue": repository_url},
     ]
@@ -124,12 +132,28 @@ def update_config_yaml(outputs: dict) -> None:
     """
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
+    alias = outputs.get("Alias", "") or ""
+    suffix = f"-{alias}" if alias else ""
+
     config["aws"]["account_id"] = outputs.get("AccountId", "")
+    config["aws"]["alias"] = alias
     config["aws"]["bucket_name"] = outputs.get("BucketName", "")
     config["aws"]["role_arn"] = outputs.get("SageMakerRoleArn", "")
     config["aws"]["region"] = outputs.get("Region", config["aws"]["region"])
     config["ecr"]["training_uri"] = outputs.get("TrainingRepositoryUri", "")
     config["ecr"]["inference_uri"] = outputs.get("InferenceRepositoryUri", "")
+
+    # alias 적용 시 의존 리소스 이름도 함께 갱신
+    config.setdefault("codebuild", {})
+    config["codebuild"]["training_project"] = outputs.get(
+        "TrainingBuildProjectName", f"groot-n16-training-build{suffix}"
+    )
+    config["codebuild"]["inference_project"] = outputs.get(
+        "InferenceBuildProjectName", f"groot-n16-inference-build{suffix}"
+    )
+    config.setdefault("inference", {})
+    config["inference"]["endpoint_name"] = f"groot-n16-endpoint{suffix}"
+    config["inference"]["model_package_group"] = f"groot-n16-models{suffix}"
 
     CONFIG_PATH.write_text(yaml.dump(config, allow_unicode=True, default_flow_style=False), encoding="utf-8")
     print(f"config.yaml 업데이트 완료: {CONFIG_PATH}")
@@ -158,32 +182,49 @@ def print_summary(outputs: dict) -> None:
     print()
 
 
+DEFAULT_STACK_BASE = "GrootSMTrainingJob"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="GR00T-N1.6 AWS 인프라 스택 배포",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
+  # 기본 (단일 사용자):
   python infra/deploy_stack.py \\
-      --stack-name groot-n16-stack \\
       --bucket-name my-groot-artifacts-20240101 \\
-      --region ap-northeast-2
+      --region us-east-1
+
+  # 멀티 사용자 (alias로 리소스 이름 충돌 방지):
+  python infra/deploy_stack.py \\
+      --alias alice \\
+      --bucket-name my-groot-artifacts-20240101-alice
         """,
     )
-    parser.add_argument("--stack-name", required=True, help="CloudFormation 스택 이름")
+    parser.add_argument("--stack-name", default="",
+                        help=f"CloudFormation 스택 이름. 미지정 시 '{DEFAULT_STACK_BASE}' (alias 지정 시 '{DEFAULT_STACK_BASE}-<alias>')")
+    parser.add_argument("--alias", default="",
+                        help="리소스 이름 충돌 방지용 postfix (예: 사용자 ID). 미지정 시 postfix 없음")
     parser.add_argument("--bucket-name", required=True, help="S3 버킷 이름 (전 세계 고유)")
-    parser.add_argument("--region", default="ap-northeast-2", help="AWS 리전 (기본값: ap-northeast-2)")
-    parser.add_argument("--role-name", default="GR00TSageMakerRole", help="SageMaker 실행 역할 이름")
+    parser.add_argument("--region", default="us-east-1", help="AWS 리전 (기본값: us-east-1)")
+    parser.add_argument("--role-name", default="GR00TSageMakerRole",
+                        help="SageMaker 실행 역할 이름 (alias 지정 시 postfix 추가)")
     parser.add_argument("--repository-url", default="", help="CodeBuild GitHub 소스 URL (선택)")
     parser.add_argument("--no-update-config", action="store_true", help="config.yaml 자동 업데이트 건너뜀")
 
     args = parser.parse_args()
 
+    stack_name = args.stack_name or (
+        f"{DEFAULT_STACK_BASE}-{args.alias}" if args.alias else DEFAULT_STACK_BASE
+    )
+
     try:
         outputs = deploy_stack(
-            stack_name=args.stack_name,
+            stack_name=stack_name,
             bucket_name=args.bucket_name,
             region=args.region,
+            alias=args.alias,
             role_name=args.role_name,
             repository_url=args.repository_url,
         )

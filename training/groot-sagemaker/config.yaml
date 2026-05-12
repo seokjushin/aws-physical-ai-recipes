@@ -1,5 +1,6 @@
 aws:
   account_id: ''
+  alias: ''
   bucket_name: ''
   region: us-east-1
   role_arn: ''

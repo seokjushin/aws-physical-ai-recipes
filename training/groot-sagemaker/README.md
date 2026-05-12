@@ -25,10 +25,12 @@
 - IAM 역할 (SageMaker 실행, CodeBuild 서비스)
 - ECR 리포지토리 2개 (`groot-n16-training`, `groot-n16-inference`)
 - CodeBuild 프로젝트 2개
-- SSM 파라미터 (`/groot/hf-token`, `/groot/wandb-key`)
+- SSM 파라미터 (`/groot/hf-token`, `/groot/wandb-key`) — 계정 공유
 - CloudWatch 로그 그룹
 
 학습은 SageMaker Training Job(또는 Pipeline) → Model Registry → Endpoint 흐름.
+
+> **여러 사용자/환경에서 같은 계정에 동시 배포** 시 리소스 이름 충돌을 막으려면 `--alias <id>`를 지정하세요 (Step 1 참고). alias가 모든 리소스 이름에 `-<alias>` postfix로 붙고, 스택 이름은 `GrootSMTrainingJob-<alias>`가 됩니다. SSM 파라미터(`/groot/*`)는 계정 공유로 그대로 사용합니다.
 
 ---
 
@@ -51,13 +53,34 @@ aws configure   # 또는 환경변수
 ## Step 1: AWS 인프라 배포
 
 ```bash
+# 단일 사용자 (스택 이름 기본값: GrootSMTrainingJob)
 python infra/deploy_stack.py \
-    --stack-name groot-n16-stack \
     --bucket-name <전 세계 고유 버킷 이름> \
     --region us-east-1
 ```
 
 `config.yaml`이 자동으로 갱신됩니다.
+
+### 멀티 사용자 / 동일 계정 충돌 방지 (`--alias`)
+
+같은 AWS 계정에 두 명 이상이 배포하거나, 한 사람이 여러 환경(dev/staging)을 분리해 운용하려면 `--alias`를 지정하세요. 모든 리소스 이름에 `-<alias>` postfix가 붙고 스택 이름은 `GrootSMTrainingJob-<alias>`가 됩니다.
+
+```bash
+python infra/deploy_stack.py \
+    --alias alice \
+    --bucket-name my-groot-artifacts-alice \
+    --region us-east-1
+```
+
+생성되는 이름 예시 (alias=alice 기준):
+- ECR: `groot-n16-training-alice`, `groot-n16-inference-alice`
+- IAM: `GR00TSageMakerRole-alice`, `GR00TCodeBuildRole-alice`
+- CodeBuild: `groot-n16-training-build-alice`, `groot-n16-inference-build-alice`
+- SageMaker Endpoint: `groot-n16-endpoint-alice`
+- Model Package Group: `groot-n16-models-alice`
+- SageMaker Pipeline: `groot-n16-finetuning-alice`
+
+> SSM 파라미터(`/groot/hf-token`, `/groot/wandb-key`)는 계정 공유 자원이므로 alias가 붙지 않습니다.
 
 ### (선택) SSM 토큰 설정
 
@@ -172,7 +195,7 @@ python scripts/run_training.py \
 
 ## Step 6: 모델 승인 (Pipeline 사용 시)
 
-콘솔: SageMaker → Model Registry → groot-n16-models → 최신 버전 → Update Status → Approved
+콘솔: SageMaker → Model Registry → groot-n16-models[-{alias}] → 최신 버전 → Update Status → Approved
 
 또는 CLI:
 ```bash
@@ -231,7 +254,10 @@ python scripts/invoke_endpoint.py \
 python scripts/deploy_endpoint.py --action delete
 
 aws s3 rm s3://<bucket> --recursive
-aws cloudformation delete-stack --stack-name groot-n16-stack
+# alias 미사용 시
+aws cloudformation delete-stack --stack-name GrootSMTrainingJob
+# alias 사용 시
+aws cloudformation delete-stack --stack-name GrootSMTrainingJob-<alias>
 ```
 
 ---

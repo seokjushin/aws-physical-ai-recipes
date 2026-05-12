@@ -35,6 +35,38 @@ def test_groot_version_n17_passes_overrides():
     assert kwargs["projectName"] == "groot-n16-training-build"
 
 
+def test_resolve_project_names_no_alias():
+    """alias 없을 때 기본 프로젝트 이름을 반환한다."""
+    import trigger_build
+
+    names = trigger_build.resolve_project_names({})
+    assert names == {
+        "training": "groot-n16-training-build",
+        "inference": "groot-n16-inference-build",
+    }
+
+
+def test_resolve_project_names_with_alias():
+    """config의 codebuild.* 값이 우선, 없으면 aws.alias로 폴백."""
+    import trigger_build
+
+    # 1) config에 명시된 이름 사용
+    names = trigger_build.resolve_project_names({
+        "codebuild": {
+            "training_project": "explicit-train",
+            "inference_project": "explicit-infer",
+        },
+    })
+    assert names == {"training": "explicit-train", "inference": "explicit-infer"}
+
+    # 2) codebuild.* 미존재, aws.alias만 있을 때 폴백
+    names = trigger_build.resolve_project_names({"aws": {"alias": "alice"}})
+    assert names == {
+        "training": "groot-n16-training-build-alice",
+        "inference": "groot-n16-inference-build-alice",
+    }
+
+
 def test_no_overrides_when_groot_version_omitted():
     """env override 없이 호출하면 environmentVariablesOverride 키가 없어야 한다."""
     import trigger_build

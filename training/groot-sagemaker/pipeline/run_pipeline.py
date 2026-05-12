@@ -62,7 +62,9 @@ def build_pipeline(config: dict, args: argparse.Namespace):
 
     role_arn = args.role_arn or aws_cfg.get("role_arn", "")
     bucket = args.bucket or aws_cfg.get("bucket_name", "")
-    region = args.region or aws_cfg.get("region", "ap-northeast-2")
+    region = args.region or aws_cfg.get("region", "us-east-1")
+    alias = aws_cfg.get("alias", "") or ""
+    suffix = f"-{alias}" if alias else ""
     training_image_uri = args.training_image_uri or ecr_cfg.get("training_uri", "")
 
     if not role_arn:
@@ -198,8 +200,9 @@ def build_pipeline(config: dict, args: argparse.Namespace):
     # -----------------------------------------------------------------------
     # 파이프라인 조립
     # -----------------------------------------------------------------------
+    pipeline_name = f"groot-n16-finetuning{suffix}"
     pipeline = Pipeline(
-        name="groot-n16-finetuning",
+        name=pipeline_name,
         parameters=[
             p_embodiment_tag,
             p_dataset_s3_uri,
@@ -292,7 +295,7 @@ def main() -> None:
     if not args.start_only:
         print("파이프라인 업서트 중 (정의 생성/업데이트)...")
         pipeline.upsert(role_arn=args.role_arn or config.get("aws", {}).get("role_arn", ""))
-        print(f"파이프라인 업서트 완료: groot-n16-finetuning")
+        print(f"파이프라인 업서트 완료: {pipeline.name}")
 
     if not args.upsert_only:
         print("파이프라인 실행 중...")
@@ -302,12 +305,14 @@ def main() -> None:
                 "DatasetS3Uri": args.dataset_s3_uri,
             }
         )
+        infer_cfg = config.get("inference", {}) or {}
+        model_package_group = infer_cfg.get("model_package_group", "groot-n16-models")
         print(f"\n파이프라인 실행 시작!")
         print(f"  실행 ARN: {execution.arn}")
         print(f"\n진행 상황 확인:")
-        print(f"  AWS 콘솔 → SageMaker → Pipelines → groot-n16-finetuning")
+        print(f"  AWS 콘솔 → SageMaker → Pipelines → {pipeline.name}")
         print(f"\n학습 완료 후:")
-        print(f"  1. SageMaker → Model Registry → groot-n16-models에서 모델 승인")
+        print(f"  1. SageMaker → Model Registry → {model_package_group}에서 모델 승인")
         print(f"  2. python scripts/deploy_endpoint.py 로 엔드포인트 배포")
 
 
