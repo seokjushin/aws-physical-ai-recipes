@@ -119,6 +119,34 @@ def parse_sagemaker_env() -> dict:
 # wandb 설정
 # -------------------------------------------------------------------------------
 
+def _resolve_aws_region() -> str:
+    """SageMaker 학습 컨테이너에서 boto3 클라이언트에 쓸 region을 결정합니다.
+
+    SageMaker는 AWS_REGION을 자동 주입하지 않을 수 있으므로
+    SM_TRAINING_ENV에서 region을 추출하거나 IMDS도 시도합니다.
+    """
+    for key in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        value = os.environ.get(key)
+        if value:
+            return value
+    # IMDSv2로 인스턴스 region 조회
+    try:
+        import urllib.request
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        token = urllib.request.urlopen(token_req, timeout=2).read().decode()
+        region_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/placement/region",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        return urllib.request.urlopen(region_req, timeout=2).read().decode()
+    except Exception:
+        return "us-east-1"
+
+
 def setup_wandb(env: dict) -> None:
     """wandb API 키를 환경변수에 설정합니다. SSM에서 읽거나 직접 설정."""
     api_key = env.get("wandb_api_key", "")
@@ -127,7 +155,7 @@ def setup_wandb(env: dict) -> None:
     if api_key.startswith("ssm:"):
         try:
             import boto3
-            ssm = boto3.client("ssm")
+            ssm = boto3.client("ssm", region_name=_resolve_aws_region())
             param_name = api_key[4:]  # "ssm:" 제거
             response = ssm.get_parameter(Name=param_name, WithDecryption=True)
             api_key = response["Parameter"]["Value"]
@@ -150,7 +178,7 @@ def setup_huggingface(env: dict) -> None:
     if token.startswith("ssm:"):
         try:
             import boto3
-            ssm = boto3.client("ssm")
+            ssm = boto3.client("ssm", region_name=_resolve_aws_region())
             param_name = token[4:]
             response = ssm.get_parameter(Name=param_name, WithDecryption=True)
             token = response["Parameter"]["Value"]
@@ -161,6 +189,40 @@ def setup_huggingface(env: dict) -> None:
     if token:
         os.environ["HF_TOKEN"] = token
         os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+
+
+def ensure_modality_files(env: dict) -> None:
+    """NEW_EMBODIMENT 학습 시 dataset에 modality_config.py / meta/modality.json이
+    없으면 source_dir에 번들된 SO-101 디폴트로 자동 배치합니다.
+
+    GR00T의 launch_finetune.py는 NEW_EMBODIMENT를 default config dict에 등록하지
+    않은 상태로 호출되면 KeyError('new_embodiment')로 실패합니다. modality_config.py
+    가 dataset root에 있어야 train.py가 --modality_config_path로 전달하고,
+    이 파일의 register_modality_config(...) 호출이 dict에 등록합니다.
+    """
+    if env["embodiment_tag"].upper() != "NEW_EMBODIMENT":
+        return  # 빌트인 embodiment는 GR00T가 자체 config 보유
+
+    dataset_dir = Path(env["dataset_dir"])
+    if not dataset_dir.is_dir():
+        return  # dataset 자체가 없으면 호출자(GR00T)가 더 명확한 에러로 실패
+
+    # source_dir에 번들된 디폴트 modality 파일
+    bundled_dir = Path(__file__).parent / "configs"
+    bundled_config_py = bundled_dir / "so101_modality_config.py"
+    bundled_modality_json = bundled_dir / "so101_modality.json"
+
+    target_config_py = dataset_dir / "modality_config.py"
+    target_modality_json = dataset_dir / "meta" / "modality.json"
+
+    if not target_config_py.exists() and bundled_config_py.exists():
+        print(f"NEW_EMBODIMENT modality_config.py 누락 → 번들 SO-101 디폴트 배치: {target_config_py}")
+        shutil.copy2(bundled_config_py, target_config_py)
+
+    if not target_modality_json.exists() and bundled_modality_json.exists():
+        print(f"NEW_EMBODIMENT meta/modality.json 누락 → 번들 SO-101 디폴트 배치: {target_modality_json}")
+        target_modality_json.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled_modality_json, target_modality_json)
 
 
 def maybe_download_hf_dataset(env: dict) -> None:
@@ -380,6 +442,7 @@ def main() -> None:
     setup_wandb(env)
     setup_huggingface(env)
     maybe_download_hf_dataset(env)
+    ensure_modality_files(env)
     run_gr00t_training(env)
     save_inference_metadata(env)
     copy_artifacts(env)
