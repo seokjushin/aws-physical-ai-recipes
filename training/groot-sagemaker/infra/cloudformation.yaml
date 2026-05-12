@@ -33,6 +33,14 @@ Parameters:
     Default: GR00TCodeBuildRole
     Description: CodeBuild 서비스 역할 이름 (Alias 지정 시 postfix 추가)
 
+  NotebookRoleName:
+    Type: String
+    Default: GR00TNotebookRole
+    Description: >
+      SageMaker Notebook 인스턴스용 사용자 역할 이름.
+      이 repo의 스크립트(deploy_stack, run_training, trigger_build,
+      deploy_endpoint 등)를 노트북에서 실행할 때 사용 (Alias 지정 시 postfix 추가)
+
   RepositoryUrl:
     Type: String
     Default: ""
@@ -246,6 +254,146 @@ Resources:
                   - !Sub "arn:aws:s3:::${BucketName}/codebuild-source/*"
 
   # ---------------------------------------------------------------------------
+  # IAM Role: SageMaker Notebook 인스턴스용 사용자 역할
+  #   - 이 repo의 스크립트(deploy_stack, run_training, trigger_build,
+  #     deploy_endpoint, invoke_endpoint 등)를 노트북에서 실행할 때 사용.
+  #   - SageMaker / S3 FullAccess 부여 + CodeBuild, ECR, CloudFormation,
+  #     IAM PassRole, SSM, CloudWatch Logs 권한 포함.
+  # ---------------------------------------------------------------------------
+  NotebookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If [HasAlias, !Sub "${NotebookRoleName}-${Alias}", !Ref NotebookRoleName]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: GR00TNotebookCodeBuildAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CodeBuildManage
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:BatchGetProjects
+                  - codebuild:ListBuilds
+                  - codebuild:ListBuildsForProject
+                  - codebuild:ListProjects
+                Resource: "*"
+        - PolicyName: GR00TNotebookECRAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ECRFull
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:CreateRepository
+                Resource: "*"
+        - PolicyName: GR00TNotebookCloudFormationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudFormationStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStacks
+                  - cloudformation:ValidateTemplate
+                Resource: "*"
+        - PolicyName: GR00TNotebookIAMPassRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PassRoleForServices
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - sagemaker.amazonaws.com
+                      - codebuild.amazonaws.com
+              - Sid: IAMRead
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:ListRoles
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                Resource: "*"
+        - PolicyName: GR00TNotebookSSMAndLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SSMParams
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                  - ssm:DescribeParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/groot/*"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*"
+              - Sid: CloudWatchLogsRead
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: "*"
+        - PolicyName: GR00TNotebookCDKAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CDKBootstrapAssumeRole
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cdk-*"
+              - Sid: CDKSTSIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: GR00T-N1.6
+        - Key: Purpose
+          Value: SageMakerNotebook
+
+  # ---------------------------------------------------------------------------
   # CodeBuild Projects: Docker 이미지 빌드 및 ECR 푸시
   # ---------------------------------------------------------------------------
   TrainingBuildProject:
@@ -392,6 +540,16 @@ Outputs:
     Value: !GetAtt SageMakerExecutionRole.Arn
     Export:
       Name: !Sub "${AWS::StackName}-SageMakerRoleArn"
+
+  NotebookRoleArn:
+    Description: SageMaker Notebook 인스턴스용 사용자 역할 ARN
+    Value: !GetAtt NotebookRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-NotebookRoleArn"
+
+  NotebookRoleName:
+    Description: SageMaker Notebook 인스턴스용 사용자 역할 이름
+    Value: !Ref NotebookRole
 
   TrainingRepositoryUri:
     Description: 학습 컨테이너 ECR URI

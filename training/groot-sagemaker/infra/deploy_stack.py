@@ -168,6 +168,7 @@ def print_summary(outputs: dict) -> None:
     print(f"  리전          : {outputs.get('Region')}")
     print(f"  S3 버킷       : {outputs.get('BucketName')}")
     print(f"  SageMaker 역할: {outputs.get('SageMakerRoleArn')}")
+    print(f"  Notebook 역할 : {outputs.get('NotebookRoleArn')}")
     print(f"  학습 ECR URI  : {outputs.get('TrainingRepositoryUri')}")
     print(f"  추론 ECR URI  : {outputs.get('InferenceRepositoryUri')}")
     print("=" * 60)
