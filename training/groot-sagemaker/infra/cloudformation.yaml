@@ -41,12 +41,31 @@ Parameters:
       이 repo의 스크립트(deploy_stack, run_training, trigger_build,
       deploy_endpoint 등)를 노트북에서 실행할 때 사용 (Alias 지정 시 postfix 추가)
 
+  MlflowTrackingServerSize:
+    Type: String
+    Default: Small
+    AllowedValues: [Small, Medium, Large]
+    Description: SageMaker managed MLflow tracking server 크기 (Small ≈ $0.642/hr).
+
   RepositoryUrl:
     Type: String
     Default: ""
     Description: >
       (선택) CodeBuild 소스용 GitHub/CodeCommit 리포지토리 URL.
       비워두면 NoSource 타입으로 생성됩니다 (로컬 zip 업로드 사용).
+
+  DefaultVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      SageMaker Studio 도메인이 ENI를 배치할 VPC.
+      PublicInternetOnly 모드여도 CloudFormation은 VPC를 요구하므로,
+      계정 기본 VPC 또는 임의의 VPC ID를 지정합니다.
+
+  DefaultSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Studio 도메인용 서브넷 ID 목록 (1개 이상).
+      DefaultVpcId 안의 서브넷이어야 합니다.
 
 # =============================================================================
 # Conditions
@@ -147,6 +166,16 @@ Resources:
                   - ecr:GetDownloadUrlForLayer
                   - ecr:BatchGetImage
                   - ecr:GetAuthorizationToken
+                Resource: "*"
+        - PolicyName: GR00TMlflowAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MlflowTracking
+                Effect: Allow
+                Action:
+                  - sagemaker-mlflow:*
+                  - sagemaker:DescribeMlflowTrackingServer
                 Resource: "*"
       Tags:
         - Key: Project
@@ -372,6 +401,22 @@ Resources:
                   - logs:GetLogEvents
                   - logs:FilterLogEvents
                 Resource: "*"
+        - PolicyName: GR00TNotebookMlflowAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: MlflowFull
+                Effect: Allow
+                Action:
+                  - sagemaker-mlflow:*
+                  - sagemaker:CreateMlflowTrackingServer
+                  - sagemaker:DeleteMlflowTrackingServer
+                  - sagemaker:DescribeMlflowTrackingServer
+                  - sagemaker:ListMlflowTrackingServers
+                  - sagemaker:StartMlflowTrackingServer
+                  - sagemaker:StopMlflowTrackingServer
+                  - sagemaker:CreatePresignedMlflowTrackingServerUrl
+                Resource: "*"
         - PolicyName: GR00TNotebookCDKAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -525,6 +570,57 @@ Resources:
         - "/aws/sagemaker/groot-n16"
       RetentionInDays: 30
 
+  # ---------------------------------------------------------------------------
+  # SageMaker Studio Domain: 학습 잡 / 파이프라인 / 모델 레지스트리 콘솔 모니터링
+  #   - PublicInternetOnly 모드 (별도 NAT/VPC 엔드포인트 불필요)
+  #   - IAM 인증 (콘솔 로그인 후 presigned URL 로 Studio 접근)
+  #   - 기본 실행 역할은 NotebookRole 재사용
+  # ---------------------------------------------------------------------------
+  StudioDomain:
+    Type: AWS::SageMaker::Domain
+    Properties:
+      DomainName: !If [HasAlias, !Sub "groot-n16-studio-${Alias}", "groot-n16-studio"]
+      AuthMode: IAM
+      AppNetworkAccessType: PublicInternetOnly
+      VpcId: !Ref DefaultVpcId
+      SubnetIds: !Ref DefaultSubnetIds
+      DefaultUserSettings:
+        ExecutionRole: !GetAtt NotebookRole.Arn
+        StudioWebPortal: ENABLED
+        DefaultLandingUri: "studio::"
+      Tags:
+        - Key: Project
+          Value: GR00T-N1.6
+
+  # ---------------------------------------------------------------------------
+  # SageMaker managed MLflow tracking server
+  #   - HF Trainer는 MLFLOW_TRACKING_URI가 설정되면 자동으로 metric/param/artifact를 로깅.
+  #   - Tracking server URI는 ARN 형식: arn:aws:sagemaker:<region>:<acct>:mlflow-tracking-server/<name>
+  #   - Always-on이므로 미사용 시 stop-mlflow-tracking-server로 정지하여 비용 절감.
+  # ---------------------------------------------------------------------------
+  MlflowTrackingServer:
+    Type: AWS::SageMaker::MlflowTrackingServer
+    Properties:
+      TrackingServerName: !If [HasAlias, !Sub "groot-mlflow-${Alias}", "groot-mlflow"]
+      ArtifactStoreUri: !Sub "s3://${BucketName}/mlflow-artifacts"
+      RoleArn: !GetAtt SageMakerExecutionRole.Arn
+      TrackingServerSize: !Ref MlflowTrackingServerSize
+      AutomaticModelRegistration: false
+      Tags:
+        - Key: Project
+          Value: GR00T-N1.6
+
+  StudioUserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !GetAtt StudioDomain.DomainId
+      UserProfileName: !If [HasAlias, !Sub "groot-${Alias}", "groot-default"]
+      UserSettings:
+        ExecutionRole: !GetAtt NotebookRole.Arn
+      Tags:
+        - Key: Project
+          Value: GR00T-N1.6
+
 # =============================================================================
 # Outputs
 # =============================================================================
@@ -582,3 +678,27 @@ Outputs:
   Alias:
     Description: 리소스 이름 postfix (alias)
     Value: !Ref Alias
+
+  StudioDomainId:
+    Description: SageMaker Studio 도메인 ID
+    Value: !GetAtt StudioDomain.DomainId
+    Export:
+      Name: !Sub "${AWS::StackName}-StudioDomainId"
+
+  StudioDomainUrl:
+    Description: SageMaker Studio 콘솔 URL (계정 콘솔에서 사용)
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/sagemaker/home?region=${AWS::Region}#/studio/${StudioDomain.DomainId}"
+
+  StudioUserProfileName:
+    Description: 기본 Studio 사용자 프로필 이름
+    Value: !If [HasAlias, !Sub "groot-${Alias}", "groot-default"]
+
+  MlflowTrackingServerArn:
+    Description: SageMaker managed MLflow tracking server ARN (MLFLOW_TRACKING_URI로 사용)
+    Value: !GetAtt MlflowTrackingServer.TrackingServerArn
+    Export:
+      Name: !Sub "${AWS::StackName}-MlflowTrackingServerArn"
+
+  MlflowTrackingServerName:
+    Description: MLflow tracking server 이름
+    Value: !If [HasAlias, !Sub "groot-mlflow-${Alias}", "groot-mlflow"]

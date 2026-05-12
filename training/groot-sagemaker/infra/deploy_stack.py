@@ -37,10 +37,72 @@ def get_account_id(session: boto3.Session) -> str:
     return sts.get_caller_identity()["Account"]
 
 
+def get_default_vpc_and_subnets(session: boto3.Session) -> tuple[str, list[str]]:
+    """계정 default VPC ID와 그 VPC 내 모든 subnet ID를 반환합니다.
+
+    Studio 도메인은 PublicInternetOnly 모드라도 VPC + Subnet을 필수로 받습니다.
+    """
+    ec2 = session.client("ec2")
+    vpcs = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])["Vpcs"]
+    if not vpcs:
+        raise RuntimeError(
+            "Default VPC가 없습니다. --vpc-id / --subnet-ids 를 명시해 주세요."
+        )
+    vpc_id = vpcs[0]["VpcId"]
+    subnets = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])["Subnets"]
+    subnet_ids = [s["SubnetId"] for s in subnets]
+    if not subnet_ids:
+        raise RuntimeError(f"VPC {vpc_id}에 subnet이 없습니다. --subnet-ids 명시 필요.")
+    return vpc_id, subnet_ids
+
+
+def get_isaac_lab_vpc_and_subnets(
+    session: boto3.Session, alias: str
+) -> tuple[str, list[str]] | None:
+    """IsaacLab-{Latest,Stable}-${alias} 부모 스택의 PrivateSubnetId Output을
+    이용해 VPC ID와 subnet 목록을 반환합니다.
+
+    부모 스택 또는 Output이 없으면 None.
+    """
+    cfn = session.client("cloudformation")
+    candidates = [f"IsaacLab-Latest-{alias}", f"IsaacLab-Stable-{alias}"]
+    private_subnet_id: str | None = None
+    found_stack: str | None = None
+
+    for stack_name in candidates:
+        try:
+            resp = cfn.describe_stacks(StackName=stack_name)
+        except ClientError as e:
+            if "does not exist" in str(e) or "ValidationError" in str(e):
+                continue
+            raise
+        stacks = resp.get("Stacks", [])
+        if not stacks:
+            continue
+        outputs = {o["OutputKey"]: o["OutputValue"] for o in stacks[0].get("Outputs", [])}
+        private_subnet_id = outputs.get("PrivateSubnetId")
+        if private_subnet_id:
+            found_stack = stack_name
+            break
+
+    if not private_subnet_id or not found_stack:
+        return None
+
+    ec2 = session.client("ec2")
+    desc = ec2.describe_subnets(SubnetIds=[private_subnet_id])["Subnets"]
+    if not desc:
+        return None
+    vpc_id = desc[0]["VpcId"]
+    print(f"IsaacLab 부모 스택 발견: {found_stack} (VPC={vpc_id}, subnet={private_subnet_id})")
+    return vpc_id, [private_subnet_id]
+
+
 def deploy_stack(
     stack_name: str,
     bucket_name: str,
     region: str,
+    vpc_id: str,
+    subnet_ids: list[str],
     alias: str = "",
     role_name: str = "GR00TSageMakerRole",
     repository_url: str = "",
@@ -51,6 +113,8 @@ def deploy_stack(
         stack_name: CloudFormation 스택 이름.
         bucket_name: S3 버킷 이름 (전 세계 고유해야 함).
         region: AWS 리전.
+        vpc_id: SageMaker Studio 도메인용 VPC ID.
+        subnet_ids: Studio 도메인용 subnet ID 리스트 (1개 이상).
         alias: 리소스 이름 충돌 방지용 postfix (선택).
         role_name: SageMaker 실행 역할 이름.
         repository_url: CodeBuild 소스 GitHub URL (선택).
@@ -69,6 +133,8 @@ def deploy_stack(
         {"ParameterKey": "Alias", "ParameterValue": alias},
         {"ParameterKey": "RoleName", "ParameterValue": role_name},
         {"ParameterKey": "RepositoryUrl", "ParameterValue": repository_url},
+        {"ParameterKey": "DefaultVpcId", "ParameterValue": vpc_id},
+        {"ParameterKey": "DefaultSubnetIds", "ParameterValue": ",".join(subnet_ids)},
     ]
 
     # 스택 존재 여부 확인
@@ -155,6 +221,13 @@ def update_config_yaml(outputs: dict) -> None:
     config["inference"]["endpoint_name"] = f"groot-n16-endpoint{suffix}"
     config["inference"]["model_package_group"] = f"groot-n16-models{suffix}"
 
+    config.setdefault("mlflow", {})
+    config["mlflow"]["tracking_server_arn"] = outputs.get("MlflowTrackingServerArn", "")
+    config["mlflow"]["tracking_server_name"] = outputs.get(
+        "MlflowTrackingServerName", f"groot-mlflow{suffix}"
+    )
+    config["mlflow"].setdefault("experiment_name", "groot-n16-finetune")
+
     CONFIG_PATH.write_text(yaml.dump(config, allow_unicode=True, default_flow_style=False), encoding="utf-8")
     print(f"config.yaml 업데이트 완료: {CONFIG_PATH}")
 
@@ -171,6 +244,10 @@ def print_summary(outputs: dict) -> None:
     print(f"  Notebook 역할 : {outputs.get('NotebookRoleArn')}")
     print(f"  학습 ECR URI  : {outputs.get('TrainingRepositoryUri')}")
     print(f"  추론 ECR URI  : {outputs.get('InferenceRepositoryUri')}")
+    print(f"  Studio 도메인 : {outputs.get('StudioDomainId')}")
+    print(f"  Studio URL    : {outputs.get('StudioDomainUrl')}")
+    print(f"  Studio 사용자 : {outputs.get('StudioUserProfileName')}")
+    print(f"  MLflow 서버   : {outputs.get('MlflowTrackingServerArn')}")
     print("=" * 60)
     print("\n다음 단계:")
     print("  1. (선택) SSM 파라미터 업데이트:")
@@ -180,6 +257,12 @@ def print_summary(outputs: dict) -> None:
     print("       python data/download_model.py")
     print("  3. 데이터셋 업로드:")
     print("       python data/upload_dataset.py --local-path ./my-dataset")
+    print("  4. SageMaker Studio 접속 (presigned URL):")
+    print(
+        f"       aws sagemaker create-presigned-domain-url "
+        f"--domain-id {outputs.get('StudioDomainId')} "
+        f"--user-profile-name {outputs.get('StudioUserProfileName')}"
+    )
     print()
 
 
@@ -212,6 +295,10 @@ def main() -> None:
     parser.add_argument("--role-name", default="GR00TSageMakerRole",
                         help="SageMaker 실행 역할 이름 (alias 지정 시 postfix 추가)")
     parser.add_argument("--repository-url", default="", help="CodeBuild GitHub 소스 URL (선택)")
+    parser.add_argument("--vpc-id", default="",
+                        help="SageMaker Studio 도메인용 VPC ID. 미지정 시 계정 default VPC 자동 탐지")
+    parser.add_argument("--subnet-ids", default="",
+                        help="Studio 도메인용 subnet ID 목록 (쉼표 구분). 미지정 시 VPC의 모든 subnet 사용")
     parser.add_argument("--no-update-config", action="store_true", help="config.yaml 자동 업데이트 건너뜀")
 
     args = parser.parse_args()
@@ -221,10 +308,35 @@ def main() -> None:
     )
 
     try:
+        # VPC / Subnet 결정 우선순위:
+        #   1) --vpc-id + --subnet-ids 명시값
+        #   2) alias 지정 시 IsaacLab-{Latest,Stable}-${alias} 부모 스택 재사용
+        #   3) 계정 default VPC + 모든 subnet
+        if args.vpc_id and args.subnet_ids:
+            vpc_id = args.vpc_id
+            subnet_ids = [s.strip() for s in args.subnet_ids.split(",") if s.strip()]
+        elif args.vpc_id or args.subnet_ids:
+            print(
+                "오류: --vpc-id 와 --subnet-ids 는 함께 지정해야 합니다 "
+                "(둘 다 비우면 IsaacLab 부모 스택 또는 default VPC 자동 사용).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        else:
+            session = boto3.Session(region_name=args.region)
+            isaac = get_isaac_lab_vpc_and_subnets(session, args.alias) if args.alias else None
+            if isaac is not None:
+                vpc_id, subnet_ids = isaac
+            else:
+                vpc_id, subnet_ids = get_default_vpc_and_subnets(session)
+                print(f"Default VPC 자동 탐지: vpc_id={vpc_id}, subnets={subnet_ids}")
+
         outputs = deploy_stack(
             stack_name=stack_name,
             bucket_name=args.bucket_name,
             region=args.region,
+            vpc_id=vpc_id,
+            subnet_ids=subnet_ids,
             alias=args.alias,
             role_name=args.role_name,
             repository_url=args.repository_url,
