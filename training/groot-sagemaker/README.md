@@ -40,13 +40,23 @@
 |------|------|
 | AWS CLI | v2 이상 |
 | Python | 3.10 이상 |
+| [uv](https://docs.astral.sh/uv/) | 최신 |
 | Git | 최신 |
 
+의존성은 `pyproject.toml` + `uv.lock`으로 관리됩니다. uv가 자동으로 Python 3.10을 격리 환경(`.venv`)에 맞춰 줍니다.
+
 ```bash
+# uv 미설치 시
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 cd training/groot-sagemaker
-pip install -r requirements-dev.txt
+uv sync                       # .venv 생성 + lock 기반 동기화
+source .venv/bin/activate     # 이후 모든 'python ...' 명령은 venv에서
+
 aws configure   # 또는 환경변수
 ```
+
+> 가상환경 활성화 없이 호출하려면 `python` 대신 `uv run python ...`을 쓰면 됩니다.
 
 ---
 
