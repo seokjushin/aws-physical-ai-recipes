@@ -183,16 +183,23 @@ def build_pipeline(config: dict, args: argparse.Namespace):
         sagemaker_session=sagemaker_session,
     )
 
+    # AWS는 CustomerMetadataValue가 최소 길이 1을 요구하므로 빈 값은 제외
+    customer_metadata = {
+        k: v for k, v in {
+            "embodiment_tag": args.embodiment_tag,
+            "dataset_s3_uri": args.dataset_s3_uri,
+            "hf_dataset_id": args.hf_dataset_id,
+            "groot_version": args.groot_version or "",
+        }.items() if v
+    }
+
     register_step = ModelStep(
         name="RegisterModel",
         step_args=model.register(
             model_package_group_name=model_package_group,
             approval_status="PendingManualApproval",
             description=f"GR00T-N1.6 파인튜닝 모델 (embodiment: {args.embodiment_tag})",
-            customer_metadata_properties={
-                "embodiment_tag": args.embodiment_tag,
-                "dataset_s3_uri": args.dataset_s3_uri,
-            },
+            customer_metadata_properties=customer_metadata,
         ),
         depends_on=[training_step],
     )
