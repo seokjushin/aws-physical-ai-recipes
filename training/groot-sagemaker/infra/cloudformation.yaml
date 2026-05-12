@@ -264,6 +264,8 @@ Resources:
             Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
           - Name: AWS_DEFAULT_REGION
             Value: !Ref AWS::Region
+          - Name: IMAGE_REPO
+            Value: !Ref TrainingRepository
           - Name: GROOT_VERSION
             Value: n1.6
           - Name: USE_STABLE
@@ -313,6 +315,8 @@ Resources:
             Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
           - Name: AWS_DEFAULT_REGION
             Value: !Ref AWS::Region
+          - Name: IMAGE_REPO
+            Value: !Ref InferenceRepository
       Source:
         Type: !If [HasRepositoryUrl, GITHUB, NO_SOURCE]
         Location: !If [HasRepositoryUrl, !Ref RepositoryUrl, !Ref AWS::NoValue]

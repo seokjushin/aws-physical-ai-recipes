@@ -5,14 +5,11 @@ version: 0.2
 # CodeBuild 환경변수 (CloudFormation에서 주입):
 #   ECR_REGISTRY        예) 123456789012.dkr.ecr.us-east-1.amazonaws.com
 #   AWS_DEFAULT_REGION  예) us-east-1
+#   IMAGE_REPO          예) groot-n16-training-<alias>
 #   GROOT_VERSION       n1.6 | n1.7
 #   USE_STABLE          true | false
 #   BASE_MODEL_PATH     예) nvidia/GR00T-N1.6-3B
 #   IMAGE_TAG           기본 latest
-
-env:
-  variables:
-    IMAGE_REPO: groot-n16-training
 
 phases:
   pre_build:
@@ -21,6 +18,7 @@ phases:
       - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
       - COMMIT_HASH=$(echo ${CODEBUILD_RESOLVED_SOURCE_VERSION:-local} | cut -c 1-8)
       - IMAGE_TAG_VERSIONED=${COMMIT_HASH:-latest}
+      - IMAGE_REPO=${IMAGE_REPO:-groot-n16-training}
       - GROOT_VERSION=${GROOT_VERSION:-n1.6}
       - USE_STABLE=${USE_STABLE:-true}
       - BASE_MODEL_PATH=${BASE_MODEL_PATH:-nvidia/GR00T-N1.6-3B}
