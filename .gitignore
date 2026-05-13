@@ -222,3 +222,7 @@ logs/
 
 # macOS
 .DS_Store
+
+# Personal scratch notes (not for public redistribution)
+/CLAUDE.md
+/GPU Capacity 확인 가이드.md

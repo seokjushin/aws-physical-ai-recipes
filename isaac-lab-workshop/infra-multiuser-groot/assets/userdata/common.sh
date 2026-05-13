@@ -133,7 +133,13 @@ apt-get install -y ros-${ROS2_DISTRO}-desktop
 # rosdep 초기화
 # Ubuntu 24.04(Jazzy)에서는 python3-rosdep2 apt 패키지가 없고,
 # DLAMI에 pip3도 미설치이므로 python3-pip 설치 후 pip로 rosdep 설치
+#
+# 주의: python3-rosdep2(0.21.0-2)는 구버전 python3-catkin-pkg(0.4.24-2),
+# python3-rospkg(1.3.0-1), python3-rosdistro(0.8.3-2)을 의존성으로 끌어오며,
+# 이들이 DLAMI에 이미 설치된 최신 python3-*-modules 패키지들과 동일 파일 경로를
+# 덮어쓰려다 dpkg unpack 충돌을 일으킴. 충돌하는 modules 패키지를 선 제거한다.
 if apt-cache show python3-rosdep2 2>/dev/null | grep -q "^Package:"; then
+  apt-get remove -y python3-catkin-pkg-modules python3-rospkg-modules python3-rosdistro-modules 2>/dev/null || true
   apt-get install -y python3-rosdep2
 else
   apt-get install -y python3-pip
