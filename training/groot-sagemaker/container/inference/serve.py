@@ -407,12 +407,8 @@ def _validate_input(body: dict) -> dict:
         except Exception:
             raise HTTPException(status_code=400, detail="'image' 필드에 유효하지 않은 base64 데이터가 포함되어 있습니다.")
 
-    # state 또는 proprioception 필수
-    if "state" not in body and "proprioception" not in body:
-        raise HTTPException(
-            status_code=400,
-            detail="'state' (dict) 또는 'proprioception' (list) 중 하나가 필요합니다.",
-        )
+    # state / proprioception 은 선택. 둘 다 없으면 _run_inference 가
+    # 모델 modality 와 _state_dims 정보로 0 으로 자동 채움.
 
     state_dict = None
     if "state" in body:
@@ -447,8 +443,9 @@ def _validate_input(body: dict) -> dict:
         result["images"] = images_dict
     if state_dict is not None:
         result["state"] = state_dict
-    else:
+    elif proprioception is not None:
         result["proprioception"] = proprioception
+    # 둘 다 미지정이면 _run_inference 가 modality 정보로 0 으로 자동 채움
     return result
 
 
@@ -481,6 +478,19 @@ def _run_inference(validated: dict) -> dict:
                 f"state dict에 필수 키 누락: {missing}. "
                 f"필요한 키: {state_keys}, state_dims: {_state_dims}"
             )
+    elif "proprioception" not in validated:
+        # state/proprioception 모두 미지정 → modality 정보로 0 으로 자동 채움.
+        # 워크숍/시연에서 첫 추론을 dummy state로 호출할 때 유용.
+        if not _state_dims or not all(sk in _state_dims for sk in state_keys):
+            raise ValueError(
+                f"state/proprioception 미지정인데 차원 정보를 자동 감지하지 못했습니다. "
+                f"state_keys={state_keys}, dims={_state_dims}. 'state' 또는 'proprioception' 명시 필요."
+            )
+        state_dict = {
+            sk: np.zeros((1, 1, _state_dims[sk]), dtype=np.float32)
+            for sk in state_keys
+        }
+        logger.info(f"state/proprioception 미지정 → 0으로 자동 채움: {[(k, _state_dims[k]) for k in state_keys]}")
     else:
         # flat proprioception → 단일 키면 전체 전달, 다중 키면 차원 정보로 분할
         state = np.array(validated["proprioception"], dtype=np.float32)

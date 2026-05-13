@@ -117,10 +117,11 @@ def invoke_endpoint(
         payload["images"] = images_b64
     else:
         payload["image"] = image_b64
-    if isinstance(proprioception, dict):
+    if isinstance(proprioception, dict) and proprioception:
         payload["state"] = proprioception
-    else:
+    elif isinstance(proprioception, list) and proprioception:
         payload["proprioception"] = proprioception
+    # else: 서버가 modality 정보로 0 자동 채움
 
     # Use sagemaker-runtime client to invoke the endpoint
     runtime_client = boto3.client("sagemaker-runtime", region_name=region)
@@ -173,12 +174,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--proprioception", required=True,
+        "--proprioception", default="",
         help=(
-            "로봇 관절 상태 벡터. 두 가지 형식 지원:\n"
+            "로봇 관절 상태 벡터 (선택). 두 가지 형식 지원:\n"
             "  Keyed (권장): single_arm:0.1,...,0.5;gripper:0.0\n"
             "  Flat:        0.1,0.2,0.3,0.4,0.5,0.0\n"
-            "값 개수와 키는 학습한 데이터셋의 meta/modality.json에 맞춰야 합니다."
+            "생략 시 서버가 모델 modality 정보로 0 으로 자동 채움 (dummy state)."
         ),
     )
     parser.add_argument(
@@ -238,9 +239,13 @@ def main() -> None:
         print("오류: --image-path 또는 --images 중 하나가 필요합니다.", file=sys.stderr)
         sys.exit(1)
 
-    # Step 2: Parse the proprioception vector
-    proprioception = parse_proprioception(args.proprioception)
-    print(f"Proprioception vector: {proprioception}")
+    # Step 2: Parse the proprioception vector (생략 시 서버가 0으로 자동 채움)
+    if args.proprioception:
+        proprioception = parse_proprioception(args.proprioception)
+        print(f"Proprioception vector: {proprioception}")
+    else:
+        proprioception = []
+        print("Proprioception 미지정 → 서버가 modality 정보로 0 자동 채움")
 
     # Step 3: Invoke the endpoint
     print(f"Invoking endpoint: {args.endpoint_name} (region: {args.region})")
