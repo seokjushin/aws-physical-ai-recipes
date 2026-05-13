@@ -84,6 +84,7 @@ def invoke_endpoint(
     instruction: str,
     region: str = "us-east-1",
     inference_component_name: str = "",
+    images_b64: dict | None = None,
 ) -> dict:
     """Send an inference request to the SageMaker endpoint.
 
@@ -110,9 +111,12 @@ def invoke_endpoint(
     # Build the request payload matching the inference handler's expected schema
     # proprioception이 dict면 state 형식, list면 flat 형식
     payload = {
-        "image": image_b64,
         "instruction": instruction,
     }
+    if images_b64:
+        payload["images"] = images_b64
+    else:
+        payload["image"] = image_b64
     if isinstance(proprioception, dict):
         payload["state"] = proprioception
     else:
@@ -155,8 +159,18 @@ def main() -> None:
         help="배포된 SageMaker 엔드포인트 이름",
     )
     parser.add_argument(
-        "--image-path", required=True,
-        help="RGB 이미지 파일 경로 (PNG, JPEG 등)",
+        "--image-path", required=False, default="",
+        help=(
+            "RGB 이미지 파일 경로 (PNG, JPEG 등). 단일 이미지를 모델의 모든 video_keys 에 broadcast.\n"
+            "여러 카메라 입력을 지정하려면 대신 --images 사용."
+        ),
+    )
+    parser.add_argument(
+        "--images", default="",
+        help=(
+            "카메라별 이미지 경로 (세미콜론 구분). 예: front=./front.png;wrist=./wrist.png\n"
+            "지정 시 --image-path 무시. 모델 video_keys 와 카메라 이름이 일치해야 함."
+        ),
     )
     parser.add_argument(
         "--proprioception", required=True,
@@ -201,10 +215,28 @@ def main() -> None:
         except Exception:
             pass  # IC가 없는 일반 엔드포인트일 수 있음
 
-    # Step 1: Load the image and encode as base64
-    print(f"Loading image from: {args.image_path}")
-    image_b64 = load_and_encode_image(args.image_path)
-    print(f"Image encoded ({len(image_b64)} base64 chars)")
+    # Step 1: Load image(s) and encode as base64
+    images_b64 = None
+    image_b64 = ""
+    if args.images:
+        # 카메라별 dict 형식: cam=path;cam2=path2
+        images_b64 = {}
+        for part in args.images.split(";"):
+            if not part.strip():
+                continue
+            cam, path = part.split("=", 1)
+            cam = cam.strip()
+            path = path.strip()
+            print(f"Loading image[{cam}] from: {path}")
+            images_b64[cam] = load_and_encode_image(path)
+        print(f"Encoded {len(images_b64)} camera images: {list(images_b64.keys())}")
+    elif args.image_path:
+        print(f"Loading image from: {args.image_path}")
+        image_b64 = load_and_encode_image(args.image_path)
+        print(f"Image encoded ({len(image_b64)} base64 chars)")
+    else:
+        print("오류: --image-path 또는 --images 중 하나가 필요합니다.", file=sys.stderr)
+        sys.exit(1)
 
     # Step 2: Parse the proprioception vector
     proprioception = parse_proprioception(args.proprioception)
@@ -219,6 +251,7 @@ def main() -> None:
         instruction=args.instruction,
         region=args.region,
         inference_component_name=args.inference_component_name,
+        images_b64=images_b64,
     )
 
     # Step 4: Print the response

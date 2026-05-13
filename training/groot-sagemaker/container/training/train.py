@@ -164,12 +164,17 @@ def setup_wandb(env: dict) -> None:
             print(f"경고: SSM에서 wandb 키 로드 실패: {e}. wandb 없이 진행합니다.")
             api_key = ""
 
-    if api_key:
+    # CFN이 만든 SSM 파라미터에 PLACEHOLDER 값이 그대로 남아 있으면 비활성화 처리.
+    # (wandb 활성화 후 401 PERMISSION_ERROR 로 학습 자체가 죽는 것을 방지)
+    if api_key and "PLACEHOLDER" not in api_key.upper():
         os.environ["WANDB_API_KEY"] = api_key
         print("wandb 활성화됨.")
     else:
         os.environ["WANDB_DISABLED"] = "true"
-        print("wandb 비활성화됨 (키 없음).")
+        if api_key:
+            print("wandb 비활성화됨 (SSM 값이 PLACEHOLDER).")
+        else:
+            print("wandb 비활성화됨 (키 없음).")
 
 
 def setup_huggingface(env: dict) -> None:
@@ -309,7 +314,15 @@ def run_gr00t_training(env: dict) -> None:
     ]
 
     # 데이터셋 안에 modality_config.py가 있으면 자동으로 전달
+    # 그 다음 우선순위로 source_dir 번들의 SO-101 디폴트(NEW_EMBODIMENT)를 사용
     modality_config_path = os.path.join(env["dataset_dir"], "modality_config.py")
+    if not os.path.isfile(modality_config_path):
+        bundled_modality = (
+            Path(__file__).parent / "configs" / "so101_modality_config.py"
+        )
+        if bundled_modality.is_file():
+            modality_config_path = str(bundled_modality)
+            print(f"dataset에 modality_config.py 없음 → 번들 디폴트 사용: {modality_config_path}")
     if os.path.isfile(modality_config_path):
         finetune_args.extend(["--modality_config_path", modality_config_path])
         print(f"Modality config 감지: {modality_config_path}")
@@ -384,7 +397,10 @@ def save_inference_metadata(env: dict) -> None:
 def copy_artifacts(env: dict) -> None:
     """학습 체크포인트를 SM_MODEL_DIR 최상위로 복사합니다.
 
-    SageMaker는 SM_MODEL_DIR의 내용을 model.tar.gz로 패키징하여 S3에 업로드합니다.
+    SageMaker는 SM_MODEL_DIR 내용을 model.tar.gz 로 패키징하여 S3 에 업로드합니다.
+    추론에는 사용되지 않는 옵티마이저/스케줄러/RNG state/trainer state 는 제외해
+    tarball 크기를 크게 줄입니다 (100GB+ → ~6-12GB).
+    제외 패턴은 HF Trainer 가 만드는 표준 파일명 기준.
     """
     checkpoint_dir = env.get("checkpoint_dir", "")
     output_dir = env["output_dir"]
@@ -393,13 +409,63 @@ def copy_artifacts(env: dict) -> None:
         print(f"경고: 체크포인트 디렉토리를 찾을 수 없음: {checkpoint_dir}")
         return
 
-    print(f"아티팩트 복사 중: {checkpoint_dir} → {output_dir}")
+    # 추론 시 불필요해 tarball 에서 제외할 파일 패턴 (basename 기준)
+    INFERENCE_EXCLUDE = {
+        "optimizer.pt",
+        "optimizer.bin",
+        "scheduler.pt",
+        "rng_state.pth",
+        "trainer_state.json",
+        "training_args.bin",
+        "scaler.pt",
+    }
 
+    def _should_skip(name: str) -> bool:
+        if name in INFERENCE_EXCLUDE:
+            return True
+        # rank-별 RNG state (rng_state_0.pth ...) 와 DeepSpeed shard 도 제거.
+        if name.startswith("rng_state_") and name.endswith(".pth"):
+            return True
+        if name.startswith("global_step") or name == "latest":
+            return True
+        return False
+
+    def _copytree_filtered(src: str, dst: str) -> None:
+        os.makedirs(dst, exist_ok=True)
+        for entry in os.listdir(src):
+            if _should_skip(entry):
+                print(f"  skip (inference 불필요): {os.path.relpath(os.path.join(src, entry), checkpoint_dir)}")
+                continue
+            s = os.path.join(src, entry)
+            d = os.path.join(dst, entry)
+            if os.path.isdir(s):
+                _copytree_filtered(s, d)
+            else:
+                shutil.copy2(s, d)
+
+    # checkpoint-N 디렉토리들 중 가장 최신(가장 큰 N)만 보존하고 나머지는 skip.
+    # 추론은 최신 가중치만 필요하고, intermediate checkpoint 가 누적되면 tarball 폭증.
+    checkpoint_subdirs = sorted(
+        (d for d in os.listdir(checkpoint_dir)
+         if d.startswith("checkpoint-") and d.split("-", 1)[1].isdigit()),
+        key=lambda d: int(d.split("-", 1)[1]),
+    )
+    keep_checkpoint = checkpoint_subdirs[-1] if checkpoint_subdirs else None
+    drop_checkpoints = set(checkpoint_subdirs[:-1])
+    if drop_checkpoints:
+        print(f"중간 체크포인트 skip (최신 {keep_checkpoint}만 보존): {sorted(drop_checkpoints)}")
+
+    print(f"아티팩트 복사 중 (추론용만): {checkpoint_dir} → {output_dir}")
     for item in os.listdir(checkpoint_dir):
+        if _should_skip(item):
+            print(f"  skip (inference 불필요): {item}")
+            continue
+        if item in drop_checkpoints:
+            continue
         src = os.path.join(checkpoint_dir, item)
         dst = os.path.join(output_dir, item)
         if os.path.isdir(src):
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            _copytree_filtered(src, dst)
         else:
             shutil.copy2(src, dst)
 

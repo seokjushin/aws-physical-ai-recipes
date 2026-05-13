@@ -30,6 +30,7 @@ from botocore.exceptions import ClientError
 PROJECT_ROOT = Path(__file__).parent.parent
 CFN_TEMPLATE_PATH = Path(__file__).parent / "cloudformation.yaml"
 CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+DEPLOY_LAMBDA_SRC_PATH = PROJECT_ROOT / "pipeline" / "lambda_deploy_endpoint.py"
 
 
 def get_account_id(session: boto3.Session) -> str:
@@ -127,6 +128,7 @@ def deploy_stack(
     account_id = get_account_id(session)
 
     template_body = CFN_TEMPLATE_PATH.read_text(encoding="utf-8")
+    deploy_lambda_code = DEPLOY_LAMBDA_SRC_PATH.read_text(encoding="utf-8")
 
     parameters = [
         {"ParameterKey": "BucketName", "ParameterValue": bucket_name},
@@ -135,6 +137,7 @@ def deploy_stack(
         {"ParameterKey": "RepositoryUrl", "ParameterValue": repository_url},
         {"ParameterKey": "DefaultVpcId", "ParameterValue": vpc_id},
         {"ParameterKey": "DefaultSubnetIds", "ParameterValue": ",".join(subnet_ids)},
+        {"ParameterKey": "DeployEndpointLambdaCode", "ParameterValue": deploy_lambda_code},
     ]
 
     # 스택 존재 여부 확인
@@ -228,6 +231,12 @@ def update_config_yaml(outputs: dict) -> None:
     )
     config["mlflow"].setdefault("experiment_name", "groot-n16-finetune")
 
+    config.setdefault("lambda", {})
+    config["lambda"]["deploy_endpoint_arn"] = outputs.get("DeployEndpointLambdaArn", "")
+    config["lambda"]["deploy_endpoint_name"] = outputs.get(
+        "DeployEndpointLambdaName", f"groot-deploy-endpoint{suffix}"
+    )
+
     CONFIG_PATH.write_text(yaml.dump(config, allow_unicode=True, default_flow_style=False), encoding="utf-8")
     print(f"config.yaml 업데이트 완료: {CONFIG_PATH}")
 
@@ -248,6 +257,7 @@ def print_summary(outputs: dict) -> None:
     print(f"  Studio URL    : {outputs.get('StudioDomainUrl')}")
     print(f"  Studio 사용자 : {outputs.get('StudioUserProfileName')}")
     print(f"  MLflow 서버   : {outputs.get('MlflowTrackingServerArn')}")
+    print(f"  Deploy Lambda : {outputs.get('DeployEndpointLambdaArn')}")
     print("=" * 60)
     print("\n다음 단계:")
     print("  1. (선택) SSM 파라미터 업데이트:")

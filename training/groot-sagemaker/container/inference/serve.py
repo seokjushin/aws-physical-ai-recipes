@@ -375,18 +375,37 @@ def _validate_input(body: dict) -> dict:
       1. "state": {"dual_arm": [12 values], "gripper": [2 values]}  (권장)
       2. "proprioception": [flat array]  (단일 상태 키 모델용)
     """
-    # image 필수
-    if "image" not in body:
-        raise HTTPException(status_code=400, detail="필수 필드 누락: ['image']")
+    # 'image' (단일) 또는 'images' (카메라별 dict) 중 하나는 필수
+    if "image" not in body and "images" not in body:
+        raise HTTPException(
+            status_code=400,
+            detail="필수 필드 누락: 'image' (단일) 또는 'images' (카메라별 dict) 중 하나가 필요합니다.",
+        )
 
-    # image: base64 문자열 검증
-    image_b64 = body["image"]
-    if not isinstance(image_b64, str) or not image_b64.strip():
-        raise HTTPException(status_code=400, detail="'image'는 비어있지 않은 base64 문자열이어야 합니다.")
-    try:
-        base64.b64decode(image_b64, validate=True)
-    except Exception:
-        raise HTTPException(status_code=400, detail="'image' 필드에 유효하지 않은 base64 데이터가 포함되어 있습니다.")
+    image_b64 = ""
+    images_dict = None
+    if "images" in body:
+        if not isinstance(body["images"], dict) or not body["images"]:
+            raise HTTPException(status_code=400, detail="'images'는 비어있지 않은 카메라별 dict 여야 합니다.")
+        images_dict = {}
+        for cam, b64 in body["images"].items():
+            if not isinstance(b64, str) or not b64.strip():
+                raise HTTPException(status_code=400, detail=f"'images.{cam}'는 비어있지 않은 base64 문자열이어야 합니다.")
+            try:
+                base64.b64decode(b64, validate=True)
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"'images.{cam}' 가 유효하지 않은 base64.")
+            images_dict[cam] = b64
+        # serve.py 내부 로직에서 'image' 도 사용하므로 첫 카메라 이미지를 fallback 으로 채움
+        image_b64 = next(iter(images_dict.values()))
+    else:
+        image_b64 = body["image"]
+        if not isinstance(image_b64, str) or not image_b64.strip():
+            raise HTTPException(status_code=400, detail="'image'는 비어있지 않은 base64 문자열이어야 합니다.")
+        try:
+            base64.b64decode(image_b64, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail="'image' 필드에 유효하지 않은 base64 데이터가 포함되어 있습니다.")
 
     # state 또는 proprioception 필수
     if "state" not in body and "proprioception" not in body:
@@ -424,6 +443,8 @@ def _validate_input(body: dict) -> dict:
         "image": image_b64,
         "instruction": instruction.strip(),
     }
+    if images_dict is not None:
+        result["images"] = images_dict
     if state_dict is not None:
         result["state"] = state_dict
     else:
@@ -442,7 +463,7 @@ def _run_inference(validated: dict) -> dict:
 
     # modality config에서 키를 동적으로 가져옴
     modality_configs = _policy.get_modality_config()
-    video_key = modality_configs["video"].modality_keys[0]
+    video_keys = list(modality_configs["video"].modality_keys)
     state_keys = modality_configs["state"].modality_keys
 
     # 상태 딕셔너리 구성
@@ -488,10 +509,28 @@ def _run_inference(validated: dict) -> dict:
                 f"예) --proprioception \"{';'.join(k + ':0.0,...' for k in state_keys)}\""
             )
 
+    # 클라이언트가 'images' dict 로 카메라별 이미지를 명시 지정한 경우 그대로 사용,
+    # 그렇지 않으면 단일 'image' 를 모든 video_keys 에 broadcast.
+    image_arr = image[np.newaxis, np.newaxis]  # (B=1, T=1, H, W, C)
+    video_inputs: dict = {}
+    images_dict = validated.get("images")
+    if images_dict:
+        for vk in video_keys:
+            if vk not in images_dict:
+                raise ValueError(
+                    f"images dict에 카메라 키 누락: '{vk}'. 모델 video_keys={video_keys}"
+                )
+            decoded = base64.b64decode(images_dict[vk])
+            arr = np.array(
+                Image.open(io.BytesIO(decoded)).convert("RGB"), dtype=np.uint8
+            )
+            video_inputs[vk] = arr[np.newaxis, np.newaxis]
+    else:
+        for vk in video_keys:
+            video_inputs[vk] = image_arr
+
     obs = {
-        "video": {
-            video_key: image[np.newaxis, np.newaxis],  # (B=1, T=1, H, W, C)
-        },
+        "video": video_inputs,
         "state": state_dict,
         "language": {
             _policy.language_key: [[validated["instruction"]]],  # (B=1, 1)

@@ -67,6 +67,13 @@ Parameters:
       Studio 도메인용 서브넷 ID 목록 (1개 이상).
       DefaultVpcId 안의 서브넷이어야 합니다.
 
+  DeployEndpointLambdaCode:
+    Type: String
+    Description: >
+      Pipeline LambdaStep용 endpoint 배포 핸들러 소스 (cleanup + create_model + create_endpoint).
+      deploy_stack.py가 pipeline/lambda_deploy_endpoint.py 내용을 읽어 전달합니다.
+    NoEcho: false
+
 # =============================================================================
 # Conditions
 # =============================================================================
@@ -177,6 +184,16 @@ Resources:
                   - sagemaker-mlflow:*
                   - sagemaker:DescribeMlflowTrackingServer
                 Resource: "*"
+        - PolicyName: GR00TPipelineLambdaInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InvokePipelineLambdas
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:groot-deploy-endpoint*"
       Tags:
         - Key: Project
           Value: GR00T-N1.6
@@ -610,6 +627,76 @@ Resources:
         - Key: Project
           Value: GR00T-N1.6
 
+  # ---------------------------------------------------------------------------
+  # Pipeline LambdaStep 용 Endpoint 배포 Lambda + IAM Role
+  #   - cleanup (기존 endpoint 삭제) → create_model → create_endpoint_config
+  #     → create_endpoint 를 atomic 하게 수행
+  #   - 코드는 DeployEndpointLambdaCode 파라미터로 주입 (deploy_stack.py 가 전달)
+  # ---------------------------------------------------------------------------
+  DeployEndpointLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !If
+        - HasAlias
+        - !Sub "GR00TDeployEndpointLambdaRole-${Alias}"
+        - "GR00TDeployEndpointLambdaRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerEndpointManage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SageMakerEndpointAndModel
+                Effect: Allow
+                Action:
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:DescribeEndpointConfig
+                  - sagemaker:DeleteEndpoint
+                  - sagemaker:DeleteEndpointConfig
+                  - sagemaker:DeleteModel
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateEndpointConfig
+                  - sagemaker:CreateEndpoint
+                  - sagemaker:AddTags
+                Resource: "*"
+              - Sid: PassExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: sagemaker.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: GR00T-N1.6
+
+  DeployEndpointLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !If
+        - HasAlias
+        - !Sub "groot-deploy-endpoint-${Alias}"
+        - "groot-deploy-endpoint"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt DeployEndpointLambdaRole.Arn
+      Timeout: 600
+      MemorySize: 256
+      Code:
+        ZipFile: !Ref DeployEndpointLambdaCode
+      Tags:
+        - Key: Project
+          Value: GR00T-N1.6
+
   StudioUserProfile:
     Type: AWS::SageMaker::UserProfile
     Properties:
@@ -702,3 +789,13 @@ Outputs:
   MlflowTrackingServerName:
     Description: MLflow tracking server 이름
     Value: !If [HasAlias, !Sub "groot-mlflow-${Alias}", "groot-mlflow"]
+
+  DeployEndpointLambdaArn:
+    Description: Pipeline LambdaStep 에서 호출하는 endpoint 배포 Lambda ARN
+    Value: !GetAtt DeployEndpointLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeployEndpointLambdaArn"
+
+  DeployEndpointLambdaName:
+    Description: endpoint 배포 Lambda 함수 이름
+    Value: !Ref DeployEndpointLambda
