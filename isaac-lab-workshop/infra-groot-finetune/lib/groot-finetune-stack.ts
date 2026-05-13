@@ -46,6 +46,7 @@ export class GrootFinetuneStack extends cdk.Stack {
       repository: ecrRepo.repository,
       useStableGroot: props.useStableGroot,
       grootVersion: props.grootVersion,
+      userId,
     });
 
     // [4] Batch Compute Environment
@@ -82,7 +83,12 @@ export class GrootFinetuneStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, 'JobDefinitionName', {
       value: batchJob.jobDefinition.jobDefinitionName!,
-      description: 'Batch Job Definition name',
+      description: 'Batch Job Definition name (single-node)',
+    });
+
+    new cdk.CfnOutput(this, 'MultiNodeJobDefinitionName', {
+      value: batchJob.multiNodeJobDefinition.jobDefinitionName,
+      description: 'Batch Job Definition name (multi-node distributed)',
     });
 
     new cdk.CfnOutput(this, 'CheckpointPath', {

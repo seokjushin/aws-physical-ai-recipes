@@ -11,6 +11,7 @@ export interface CodeBuildInfraProps {
   repository: ecr.IRepository;
   useStableGroot?: boolean;
   grootVersion?: string;
+  userId?: string;
 }
 
 export class CodeBuildInfra extends Construct {
@@ -27,8 +28,12 @@ export class CodeBuildInfra extends Construct {
       exclude: ['*.pyc', '__pycache__', '.git', '*.egg-info'],
     });
 
+    const projectName = props.userId
+      ? `GrootFinetuneContainerBuild-${props.userId}`
+      : 'GrootFinetuneContainerBuild';
+
     this.project = new codebuild.Project(this, 'BuildProject', {
-      projectName: 'GrootFinetuneContainerBuild',
+      projectName,
       description: 'Builds GR00T fine-tuning container and pushes to ECR',
       source: codebuild.Source.s3({
         bucket: sourceAsset.bucket,
