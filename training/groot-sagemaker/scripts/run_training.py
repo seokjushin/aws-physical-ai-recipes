@@ -62,6 +62,7 @@ def launch_training_job(args: argparse.Namespace, config: dict) -> str:
     aws_cfg = config.get("aws", {})
     train_cfg = config.get("training", {})
     ecr_cfg = config.get("ecr", {})
+    mlflow_cfg = config.get("mlflow", {})
 
     role_arn = args.role_arn or aws_cfg.get("role_arn", "")
     bucket = args.bucket or aws_cfg.get("bucket_name", "")
@@ -124,6 +125,31 @@ def launch_training_job(args: argparse.Namespace, config: dict) -> str:
     # Script Mode: train.py를 컨테이너에 런타임에 주입 (Docker 재빌드 없이 수정 반영)
     train_source_dir = str(Path(__file__).resolve().parents[1] / "container" / "training")
 
+    # HF Trainer가 stdout으로 출력하는 dict 로그를 SageMaker CloudWatch metric으로 발행
+    # 예: {'loss': 0.63, 'grad_norm': 1.2, 'learning_rate': 5e-5, 'epoch': 0.01}
+    # 평가 단계: {'eval_loss': 0.55, 'eval_runtime': 1.2, ...}
+    metric_definitions = [
+        {"Name": "train:loss",          "Regex": r"'loss':\s*([0-9.eE+-]+)"},
+        {"Name": "train:grad_norm",     "Regex": r"'grad_norm':\s*([0-9.eE+-]+)"},
+        {"Name": "train:learning_rate", "Regex": r"'learning_rate':\s*([0-9.eE+-]+)"},
+        {"Name": "train:epoch",         "Regex": r"'epoch':\s*([0-9.eE+-]+)"},
+        {"Name": "eval:loss",           "Regex": r"'eval_loss':\s*([0-9.eE+-]+)"},
+        {"Name": "eval:runtime",        "Regex": r"'eval_runtime':\s*([0-9.eE+-]+)"},
+    ]
+
+    # MLflow 환경변수: tracking server ARN이 config.yaml에 있으면 자동 주입.
+    # HF Trainer는 mlflow 패키지 + MLFLOW_TRACKING_URI를 감지하면
+    # MLflowCallback을 활성화하여 metric/param/artifact를 자동 로깅.
+    container_env = {}
+    mlflow_arn = args.mlflow_arn or mlflow_cfg.get("tracking_server_arn", "")
+    if mlflow_arn:
+        container_env["MLFLOW_TRACKING_URI"] = mlflow_arn
+        container_env["MLFLOW_EXPERIMENT_NAME"] = (
+            args.mlflow_experiment or mlflow_cfg.get("experiment_name", "groot-n16-finetune")
+        )
+        container_env["HF_MLFLOW_LOG_ARTIFACTS"] = "true"
+        print(f"MLflow 활성화: {mlflow_arn}")
+
     estimator_kwargs = dict(
         image_uri=training_image_uri,
         role=role_arn,
@@ -133,8 +159,11 @@ def launch_training_job(args: argparse.Namespace, config: dict) -> str:
         instance_count=1,
         output_path=f"s3://{bucket}/output",
         hyperparameters=hyperparameters,
+        metric_definitions=metric_definitions,
         sagemaker_session=session,
     )
+    if container_env:
+        estimator_kwargs["environment"] = container_env
 
     if use_spot:
         estimator_kwargs.update(
@@ -258,6 +287,12 @@ def main() -> None:
                         help="Spot Instance 비활성화")
     parser.add_argument("--no-wait", action="store_true",
                         help="학습 완료 대기 없이 즉시 반환")
+    parser.add_argument("--mlflow-arn",
+                        default=config.get("mlflow", {}).get("tracking_server_arn", ""),
+                        help="SageMaker MLflow tracking server ARN (config.yaml의 mlflow.tracking_server_arn 우선)")
+    parser.add_argument("--mlflow-experiment",
+                        default=config.get("mlflow", {}).get("experiment_name", "groot-n16-finetune"),
+                        help="MLflow experiment 이름 (기본: groot-n16-finetune)")
 
     args = parser.parse_args()
 

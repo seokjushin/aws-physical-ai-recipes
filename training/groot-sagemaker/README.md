@@ -27,6 +27,7 @@
 - CodeBuild 프로젝트 2개
 - SSM 파라미터 (`/groot/hf-token`, `/groot/wandb-key`) — 계정 공유
 - CloudWatch 로그 그룹
+- SageMaker managed **MLflow tracking server** (`groot-mlflow[-{alias}]`)
 
 학습은 SageMaker Training Job(또는 Pipeline) → Model Registry → Endpoint 흐름.
 
@@ -203,6 +204,50 @@ python scripts/run_training.py \
 
 ---
 
+## 학습 모니터링 (CloudWatch + MLflow)
+
+### CloudWatch metric — Training Job 콘솔의 *Performance* 탭
+
+`scripts/run_training.py` / `pipeline/run_pipeline.py`는 Estimator에 `metric_definitions`을 자동으로 주입합니다. HF Trainer가 stdout으로 출력하는 dict 로그(`{'loss': ..., 'grad_norm': ..., 'learning_rate': ...}`)를 정규식으로 파싱하여 CloudWatch에 발행:
+
+| Metric | 의미 |
+|---|---|
+| `train:loss` | 학습 step loss |
+| `train:grad_norm` | gradient norm |
+| `train:learning_rate` | 현재 LR |
+| `train:epoch` | 진행도 |
+| `eval:loss` / `eval:runtime` | (eval step 활성화 시) |
+
+발행된 metric은 SageMaker Console → Training Jobs → 해당 job의 *Performance* 차트, 또는 CloudWatch Metrics → `/aws/sagemaker/TrainingJobs` namespace에서 조회.
+
+### MLflow tracking — run/metric/param/artifact 풍부 추적
+
+CloudFormation이 SageMaker managed MLflow tracking server(`groot-mlflow[-{alias}]`, Small ≈ $0.64/hr always-on)를 생성하고, `infra/deploy_stack.py`가 ARN을 `config.yaml`의 `mlflow.tracking_server_arn`에 기록합니다. 학습 스크립트는 이 ARN을 컨테이너 env (`MLFLOW_TRACKING_URI` / `MLFLOW_EXPERIMENT_NAME` / `HF_MLFLOW_LOG_ARTIFACTS=true`)로 자동 주입.
+
+> **GR00T 특이사항**: GR00T `experiment.py`가 `report_to="wandb" if use_wandb else "none"`로 하드코딩하여 MLflow callback이 자동 등록되지 않습니다. 이를 우회하려고 `container/training/sitecustomize.py`가 `transformers.TrainingArguments.__post_init__`을 monkey-patch하여 `MLFLOW_TRACKING_URI`가 설정되어 있으면 `report_to`에 `mlflow`를 강제 추가합니다. (Script Mode로 자동 주입되므로 Docker 재빌드 불필요.)
+
+**MLflow UI 접속:**
+
+```bash
+aws sagemaker create-presigned-mlflow-tracking-server-url \
+    --tracking-server-name groot-mlflow-yoo \
+    --query AuthorizedUrl --output text
+```
+
+발급된 URL을 브라우저에 붙여 넣으면 experiment `groot-n16-finetune` 아래 run 별로 metric/param 233개+ / artifact (checkpoint safetensors + DeepSpeed optimizer states) 확인 가능. S3 backing store는 `s3://<bucket>/mlflow-artifacts/`.
+
+**비용 절감 — 안 쓸 때 정지:**
+
+```bash
+aws sagemaker stop-mlflow-tracking-server --tracking-server-name groot-mlflow-yoo
+# 다시 사용
+aws sagemaker start-mlflow-tracking-server --tracking-server-name groot-mlflow-yoo
+```
+
+**대안 — Weights & Biases:** SSM `/groot/wandb-key`에 wandb API 키를 넣고 `--wandb-api-key ssm:/groot/wandb-key`를 학습 명령에 추가하면 wandb로도 동시 로깅 가능 (MLflow와 wandb가 둘 다 켜짐).
+
+---
+
 ## Step 6: 모델 승인 (Pipeline 사용 시)
 
 콘솔: SageMaker → Model Registry → groot-n16-models[-{alias}] → 최신 버전 → Update Status → Approved
@@ -294,6 +339,8 @@ GR00T 내장 embodiment(`LIBERO_PANDA` 등) 사용 시 `--embodiment-tag LIBERO_
 | Batch 베이스라인 (N1.6, 100 step) | ❌ Skipped — 우리 변경 범위 밖. `infra-groot-finetune` 컨테이너의 transformers 버전이 GR00T-N1.6 model_type을 인식하지 못함 (`Gr00tN1d6` not recognized). 이 가이드의 코드 변경과는 무관. |
 | CFN deploy + ECR build (training + inference) | ✅ Success. Training 이미지 3 태그 push (`latest`, `n1.6`, commit hash). |
 | SageMaker Training Job — S3 채널 | ✅ Completed (job `groot-n16-training-2026-05-12-04-16-10-593`, ml.g5.12xlarge × 1 instance, 4 GPU, batch_size 32, 100 step, 1655s). model.tar.gz 123MB → S3. |
+| CloudWatch metric 발행 (`train:loss/grad_norm/learning_rate`) | ✅ Completed. Estimator `metric_definitions` regex가 HF Trainer dict 로그를 정상 파싱. SageMaker Console *Performance* 탭에 곡선 표시. |
+| MLflow tracking 연동 (managed server, 100-step run) | ✅ Completed. Run `e4bf6f5a...` FINISHED, metrics 8개(loss/grad_norm/lr/runtime/throughput/total_flos), params 233개, artifact (checkpoint safetensors ~9.9GB + DeepSpeed optim states) 모두 업로드. |
 | SageMaker Training Job — HF 직접 다운 | ⚠️ Code path 검증 완료(컨테이너 내부에서 HF 데이터셋 다운로드 성공). 동일 코드 경로라 별도 학습은 cost 절감 위해 skip. |
 | Loss 곡선 비교 (Batch vs SM) | ⚠️ Skipped (Batch baseline failed). |
 | SM Endpoint 추론 | ⚠️ Endpoint 배포 시도 실패 (CreateEndpoint returned generic service error before container start; CloudWatch 로그 그룹 미생성). 별도 트러블슈팅 필요 — inference 컨테이너 build/start 경로 점검 필요. |
@@ -305,6 +352,8 @@ GR00T 내장 embodiment(`LIBERO_PANDA` 등) 사용 시 `--embodiment-tag LIBERO_
 - `estimator.fit(inputs={})` → SageMaker `InputDataConfig`가 비어있으면 거부. HF 직접 다운 경로는 `inputs=None`으로 변경.
 - `estimator.model_data` 조회가 `--no-wait` 모드에서 KeyError. `--no-wait`이면 skip.
 - Estimator에 `entry_point="train.py"` + `source_dir`이 누락되어 SageMaker Training Toolkit이 entry_point 없이 호출 → AttributeError. 명시 추가 (Script Mode).
+- Dockerfile `pip install mlflow`이 Ubuntu 22.04 base의 `blinker 1.4` (distutils-installed) 우려로 실패 → `pip install --ignore-installed blinker mlflow sagemaker-mlflow`로 우회.
+- GR00T `experiment.py`가 `report_to="wandb" if use_wandb else "none"`로 하드코딩하여 HF Trainer가 MLflowCallback을 자동 등록하지 못함. `container/training/sitecustomize.py`로 `TrainingArguments.__post_init__`을 monkey-patch해 `MLFLOW_TRACKING_URI`가 있으면 `report_to`에 mlflow를 강제 추가.
 
 ---
 
@@ -318,6 +367,10 @@ GR00T 내장 embodiment(`LIBERO_PANDA` 등) 사용 시 `--embodiment-tag LIBERO_
 | SageMaker Training Job ResourceLimitExceeded | 인스턴스 쿼터 부족 | Service Quotas에서 ml.g5.2xlarge 또는 ml.g6e.xlarge 증가 |
 | Endpoint 5xx | model.tar.gz에 inference_metadata.json 누락 | train.py가 자동 저장하므로 학습 로그 확인 |
 | 추론 차원 불일치 | proprioception 값 개수 ≠ 모델 기대값 | 에러 메시지에 출력된 keyed 형식대로 호출 |
+| Performance 탭이 비어있음 | CFN/컨테이너가 stale (구버전) | `python infra/deploy_stack.py ...` + `python scripts/trigger_build.py --type training`으로 갱신 후 재학습 |
+| MLflow UI에 run이 안 보임 | `MLFLOW_TRACKING_URI` 미주입 또는 sitecustomize.py 미적용 | `config.yaml`의 `mlflow.tracking_server_arn` 값 확인 / `container/training/sitecustomize.py` 존재 확인 |
+| `MlflowException: Resource ... not found` | tracking server 정지됨 | `aws sagemaker start-mlflow-tracking-server --tracking-server-name groot-mlflow-<alias>` |
+| Docker build 실패 `Cannot uninstall blinker 1.4` | Ubuntu 22.04 base의 distutils blinker | Dockerfile에 `--ignore-installed blinker` 옵션 (이미 적용됨) |
 
 ---
 

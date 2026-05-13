@@ -113,6 +113,16 @@ RUN pip install --no-cache-dir torchcodec
 RUN pip install --no-cache-dir sagemaker-training
 
 # ---------------------------------------------------------------------------
+# MLflow + sagemaker-mlflow auth plugin
+# ---------------------------------------------------------------------------
+# MLFLOW_TRACKING_URI가 SageMaker MLflow ARN으로 설정되면 sagemaker-mlflow가
+# SigV4 인증을 자동 처리. HF Trainer는 mlflow가 설치되어 있고 URI가 있으면
+# MLflowCallback을 자동 활성화하여 metric/param/artifact를 로깅.
+# --ignore-installed blinker: Ubuntu 22.04 base의 distutils-installed blinker 1.4를
+# 안전 제거하지 못해 mlflow→Flask 설치가 실패하므로 우회.
+RUN pip install --no-cache-dir --ignore-installed blinker mlflow sagemaker-mlflow
+
+# ---------------------------------------------------------------------------
 # SageMaker 디렉토리 구조
 # ---------------------------------------------------------------------------
 RUN mkdir -p /opt/ml/model /opt/ml/input/data /opt/ml/output /opt/ml/code

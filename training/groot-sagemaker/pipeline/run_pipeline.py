@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """GR00T-N1.6 SageMaker Pipeline 실행 스크립트.
 
-학습 → 모델 레지스트리 등록의 두 단계로 구성된 파이프라인을 생성하고 실행합니다.
+학습 → 모델 레지스트리 등록 → endpoint 자동 배포의 세 단계로 구성된 파이프라인.
 
 파이프라인 구성:
   1. GR00TFinetune  : SageMaker Training Job (Spot Instance 선택 가능)
-  2. RegisterModel  : 완료된 모델을 Model Registry에 등록 (수동 승인 대기)
+  2. RegisterModel  : Model Registry에 Approved 상태로 등록
+  3. DeployEndpoint : LambdaStep — 기존 endpoint 정리 + Model/EndpointConfig/Endpoint 생성
 
-모델 승인 후 엔드포인트 배포는 scripts/deploy_endpoint.py로 수행합니다.
+Step 2 와 Step 3 는 같은 training artifact 를 사용하는 병렬 흐름입니다
+(Registry 기록 vs 실 배포). Endpoint 가 InService 가 되기까지는 5-10 분 더 걸리며,
+Lambda 는 create_endpoint API 호출 성공만 확인하고 종료합니다.
 
 사용법:
     # 파이프라인 생성 및 실행
@@ -50,6 +53,8 @@ def build_pipeline(config: dict, args: argparse.Namespace):
         from sagemaker.workflow.pipeline_context import PipelineSession
         from sagemaker.workflow.steps import TrainingStep
         from sagemaker.workflow.model_step import ModelStep
+        from sagemaker.workflow.lambda_step import LambdaStep
+        from sagemaker.lambda_helper import Lambda
     except ImportError:
         print("오류: sagemaker SDK가 설치되지 않았습니다.")
         print("  pip install 'sagemaker<3'")
@@ -113,6 +118,14 @@ def build_pipeline(config: dict, args: argparse.Namespace):
         name="NumGpus",
         default_value=args.num_gpus or train_cfg.get("num_gpus", 1),
     )
+    p_endpoint_name = ParameterString(
+        name="EndpointName",
+        default_value=args.endpoint_name or infer_cfg.get("endpoint_name", f"groot-n16-endpoint{suffix}"),
+    )
+    p_endpoint_instance_type = ParameterString(
+        name="EndpointInstanceType",
+        default_value=args.endpoint_instance_type or infer_cfg.get("instance_type", "ml.g5.2xlarge"),
+    )
 
     # -----------------------------------------------------------------------
     # Step 1: Training Job (Spot Instance)
@@ -123,6 +136,16 @@ def build_pipeline(config: dict, args: argparse.Namespace):
     # Script Mode: train.py를 런타임에 주입 (Docker 재빌드 없이 스크립트 수정 반영)
     train_source_dir = str(PROJECT_ROOT / "container" / "training")
 
+    # HF Trainer stdout dict 로그 → CloudWatch metric
+    metric_definitions = [
+        {"Name": "train:loss",          "Regex": r"'loss':\s*([0-9.eE+-]+)"},
+        {"Name": "train:grad_norm",     "Regex": r"'grad_norm':\s*([0-9.eE+-]+)"},
+        {"Name": "train:learning_rate", "Regex": r"'learning_rate':\s*([0-9.eE+-]+)"},
+        {"Name": "train:epoch",         "Regex": r"'epoch':\s*([0-9.eE+-]+)"},
+        {"Name": "eval:loss",           "Regex": r"'eval_loss':\s*([0-9.eE+-]+)"},
+        {"Name": "eval:runtime",        "Regex": r"'eval_runtime':\s*([0-9.eE+-]+)"},
+    ]
+
     estimator_kwargs = dict(
         image_uri=training_image_uri,
         role=role_arn,
@@ -131,6 +154,7 @@ def build_pipeline(config: dict, args: argparse.Namespace):
         instance_type=p_instance_type,
         instance_count=1,
         output_path=f"s3://{bucket}/output",
+        metric_definitions=metric_definitions,
         hyperparameters={
             "embodiment_tag": p_embodiment_tag,
             "max_steps": p_max_steps,
@@ -145,6 +169,14 @@ def build_pipeline(config: dict, args: argparse.Namespace):
         environment={
             # wandb 키는 SSM에서 직접 읽도록 설정
             "SM_HP_WANDB_API_KEY": "ssm:/groot/wandb-key",
+            # MLflow tracking server (config.yaml의 mlflow.tracking_server_arn).
+            # HF Trainer가 mlflow 패키지 + MLFLOW_TRACKING_URI를 감지하면 자동 로깅.
+            **({"MLFLOW_TRACKING_URI": config.get("mlflow", {}).get("tracking_server_arn", "")}
+               if config.get("mlflow", {}).get("tracking_server_arn") else {}),
+            **({"MLFLOW_EXPERIMENT_NAME": config.get("mlflow", {}).get("experiment_name", "groot-n16-finetune")}
+               if config.get("mlflow", {}).get("tracking_server_arn") else {}),
+            **({"HF_MLFLOW_LOG_ARTIFACTS": "true"}
+               if config.get("mlflow", {}).get("tracking_server_arn") else {}),
         },
     )
 
@@ -197,10 +229,38 @@ def build_pipeline(config: dict, args: argparse.Namespace):
         name="RegisterModel",
         step_args=model.register(
             model_package_group_name=model_package_group,
-            approval_status="PendingManualApproval",
+            approval_status="Approved",
             description=f"GR00T-N1.6 파인튜닝 모델 (embodiment: {args.embodiment_tag})",
             customer_metadata_properties=customer_metadata,
         ),
+        depends_on=[training_step],
+    )
+
+    # -----------------------------------------------------------------------
+    # Step 3: Endpoint 자동 배포 (LambdaStep)
+    #   기존 endpoint 삭제 → Model/EndpointConfig/Endpoint 생성 atomic 수행
+    # -----------------------------------------------------------------------
+    lambda_cfg = config.get("lambda", {}) or {}
+    deploy_lambda_arn = args.deploy_lambda_arn or lambda_cfg.get("deploy_endpoint_arn", "")
+    if not deploy_lambda_arn:
+        print("오류: endpoint 배포 Lambda ARN 이 필요합니다.")
+        print("  infra/deploy_stack.py 를 다시 실행해 config.yaml의 lambda.deploy_endpoint_arn 을 채우세요.")
+        sys.exit(1)
+
+    deploy_step = LambdaStep(
+        name="DeployEndpoint",
+        lambda_func=Lambda(
+            function_arn=deploy_lambda_arn,
+            session=sagemaker_session,
+        ),
+        inputs={
+            "endpoint_name": p_endpoint_name,
+            "instance_type": p_endpoint_instance_type,
+            "model_data": training_step.properties.ModelArtifacts.S3ModelArtifacts,
+            "image_uri": inference_image_uri,
+            "role_arn": role_arn,
+            "region": region,
+        },
         depends_on=[training_step],
     )
 
@@ -217,8 +277,10 @@ def build_pipeline(config: dict, args: argparse.Namespace):
             p_max_steps,
             p_global_batch_size,
             p_num_gpus,
+            p_endpoint_name,
+            p_endpoint_instance_type,
         ],
-        steps=[training_step, register_step],
+        steps=[training_step, register_step, deploy_step],
         sagemaker_session=sagemaker_session,
     )
 
@@ -289,6 +351,15 @@ def main() -> None:
                         help="파이프라인 정의만 업서트하고 실행하지 않음")
     parser.add_argument("--start-only", action="store_true",
                         help="파이프라인 업서트 없이 기존 파이프라인만 실행")
+    parser.add_argument("--endpoint-name",
+                        default=config.get("inference", {}).get("endpoint_name", ""),
+                        help="배포할 endpoint 이름 (기본: config.yaml의 inference.endpoint_name)")
+    parser.add_argument("--endpoint-instance-type",
+                        default=config.get("inference", {}).get("instance_type", "ml.g5.2xlarge"),
+                        help="endpoint 인스턴스 타입 (기본: config.yaml의 inference.instance_type)")
+    parser.add_argument("--deploy-lambda-arn",
+                        default=config.get("lambda", {}).get("deploy_endpoint_arn", ""),
+                        help="endpoint 배포 LambdaStep 함수 ARN (기본: config.yaml의 lambda.deploy_endpoint_arn)")
 
     args = parser.parse_args()
 
@@ -306,21 +377,33 @@ def main() -> None:
 
     if not args.upsert_only:
         print("파이프라인 실행 중...")
-        execution = pipeline.start(
-            parameters={
-                "EmbodimentTag": args.embodiment_tag,
-                "DatasetS3Uri": args.dataset_s3_uri,
-            }
-        )
+        # ParameterString/Integer 의 default 가 박혀있어도, --start-only 로 재실행할 때
+        # CLI 인자가 그대로 동작하도록 모두 명시 전달.
+        start_params = {
+            "EmbodimentTag": args.embodiment_tag,
+            "DatasetS3Uri": args.dataset_s3_uri,
+            "MaxSteps": args.max_steps,
+            "GlobalBatchSize": args.global_batch_size,
+            "NumGpus": args.num_gpus,
+        }
+        if args.instance_type:
+            start_params["InstanceType"] = args.instance_type
+        if args.endpoint_name:
+            start_params["EndpointName"] = args.endpoint_name
+        if args.endpoint_instance_type:
+            start_params["EndpointInstanceType"] = args.endpoint_instance_type
+
+        execution = pipeline.start(parameters=start_params)
         infer_cfg = config.get("inference", {}) or {}
-        model_package_group = infer_cfg.get("model_package_group", "groot-n16-models")
+        endpoint_name = args.endpoint_name or infer_cfg.get("endpoint_name", "")
         print(f"\n파이프라인 실행 시작!")
         print(f"  실행 ARN: {execution.arn}")
         print(f"\n진행 상황 확인:")
         print(f"  AWS 콘솔 → SageMaker → Pipelines → {pipeline.name}")
-        print(f"\n학습 완료 후:")
-        print(f"  1. SageMaker → Model Registry → {model_package_group}에서 모델 승인")
-        print(f"  2. python scripts/deploy_endpoint.py 로 엔드포인트 배포")
+        print(f"\n파이프라인 완료 후 (~15-20분):")
+        print(f"  · endpoint 가 자동 배포됩니다 (LambdaStep). InService 까지 추가 5-10분 소요.")
+        print(f"  · 상태 확인: aws sagemaker describe-endpoint --endpoint-name {endpoint_name}")
+        print(f"  · 추론 호출: python scripts/invoke_endpoint.py --image-path ./sample/test.png ...")
 
 
 if __name__ == "__main__":
