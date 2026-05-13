@@ -153,6 +153,31 @@ class FinetuneWorkflow:
         # if missing (LeIsaac compatible key)
         self._patch_parquet_annotations()
 
+        # Pre-generate stats.json required by experiment.run() — avoids race
+        # condition in multi-node where rank 0 generates it but rank 1 can't find it.
+        stats_path = os.path.join(self.dataset_local_dir, "meta", "stats.json")
+        if not os.path.isfile(stats_path):
+            logger.info("Generating dataset stats.json (required for training)...")
+            import subprocess
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "gr00t.data.stats",
+                    self.dataset_local_dir,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"Stats generation via gr00t.data.stats failed: {result.stderr}. "
+                    "Training may still proceed if run() generates stats internally."
+                )
+            else:
+                logger.info("Generated stats.json successfully")
+
     def _patch_parquet_annotations(self):
         """Add annotation.human.task_description column to parquet files if missing."""
         annotation_col = "annotation.human.task_description"
@@ -348,8 +373,12 @@ class FinetuneWorkflow:
         try:
             logger.info("Starting GR00T N1.7 fine-tuning...")
 
-            # Step 1: Validate dataset was prepared by entrypoint script
-            self.validate_dataset()
+            # Step 1: Validate dataset (only main node in multi-node setup)
+            node_rank = int(os.environ.get("NODE_RANK", "0"))
+            if node_rank == 0:
+                self.validate_dataset()
+            else:
+                logger.info(f"Worker node {node_rank}: skipping dataset validation (main node handles it)")
 
             # Step 2: Run training
             self.run_training()

@@ -74,19 +74,27 @@ fi
 NUM_NODES=${NUM_NODES:-1}
 if [ "$NUM_NODES" -gt 1 ]; then
     echo "Multi-node training detected: NUM_NODES=$NUM_NODES"
-    # AWS Batch sets AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS (IP of node 0)
-    # and AWS_BATCH_JOB_NODE_INDEX (0-based index of this node)
-    if [ -n "$AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS" ]; then
-        export MASTER_ADDR="$AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS"
+    # AWS Batch sets:
+    #   AWS_BATCH_JOB_NODE_INDEX: 0-based index of this node (all nodes)
+    #   AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS: IP of main node (worker nodes ONLY)
+    # Main node (index 0) must discover its own IP via hostname.
+    export NODE_RANK="${AWS_BATCH_JOB_NODE_INDEX:-0}"
+    if [ "$NODE_RANK" -eq 0 ]; then
+        export MASTER_ADDR="${MASTER_ADDR:-$(hostname -i | awk '{print $1}')}"
     else
-        export MASTER_ADDR="${MASTER_ADDR:-localhost}"
+        export MASTER_ADDR="${AWS_BATCH_JOB_MAIN_NODE_PRIVATE_IPV4_ADDRESS:-${MASTER_ADDR:-localhost}}"
     fi
     export MASTER_PORT="${MASTER_PORT:-29500}"
-    export NODE_RANK="${AWS_BATCH_JOB_NODE_INDEX:-0}"
     echo "MASTER_ADDR: $MASTER_ADDR"
     echo "MASTER_PORT: $MASTER_PORT"
     echo "NODE_RANK: $NODE_RANK"
     echo "=========================================="
+fi
+
+# In multi-node Batch jobs, AWS_BATCH_JOB_ID includes "#<node_index>" suffix.
+# Strip it so all nodes share the same OUTPUT_DIR.
+if [ -n "$AWS_BATCH_JOB_ID" ]; then
+    export AWS_BATCH_JOB_ID="${AWS_BATCH_JOB_ID%%#*}"
 fi
 
 # Warn if using W&B in online mode without an API key
@@ -171,107 +179,163 @@ if [ "${REPORT_TO}" = "wandb" ]; then
 fi
 
 # Resolve dataset source according to priority and ensure accessibility
+# In multi-node: only the main node (rank 0) downloads/prepares data.
+# Workers wait for the ready flag (set later) and use the same EFS path.
 SAMPLE_REPO_DIR="/workspace/sample-embodied-ai-platform"
 DEFAULT_SAMPLE_DATASET_DIR="$SAMPLE_REPO_DIR/training/sample_dataset"
 RESOLVED_DATASET_DIR=""
 
-echo "[Step] Resolve dataset source (priority: local -> s3 -> hf -> sample)"
+# For multi-node, default download target is EFS so all nodes can access it.
+if [ "$NUM_NODES" -gt 1 ]; then
+    MULTINODE_DATASET_DIR="/mnt/efs/gr00t/datasets/${AWS_BATCH_JOB_ID:-shared}"
+fi
 
-# 1) DATASET_LOCAL_DIR
-if [ -n "$DATASET_LOCAL_DIR" ] && [ -d "$DATASET_LOCAL_DIR" ] && [ -n "$(ls -A "$DATASET_LOCAL_DIR" 2>/dev/null)" ]; then
-    RESOLVED_DATASET_DIR="$DATASET_LOCAL_DIR"
-    echo "Using DATASET_LOCAL_DIR: $RESOLVED_DATASET_DIR"
-# 2) DATASET_S3_URI
-elif [ -n "$DATASET_S3_URI" ]; then
-    RESOLVED_DATASET_DIR="${DATASET_LOCAL_DIR:-/workspace/train}"
-    echo "DATASET_S3_URI provided. Will sync into: $RESOLVED_DATASET_DIR"
-    mkdir -p "$RESOLVED_DATASET_DIR"
-    if ! command -v aws >/dev/null 2>&1; then
-        echo "ERROR: aws CLI is required to sync S3 dataset but was not found in PATH"
-        exit 1
-    fi
-    echo "Syncing dataset from $DATASET_S3_URI to $RESOLVED_DATASET_DIR ..."
-    aws s3 sync "$DATASET_S3_URI" "$RESOLVED_DATASET_DIR" --no-progress
-    if [ -z "$(ls -A "$RESOLVED_DATASET_DIR" 2>/dev/null)" ]; then
-        echo "ERROR: No files synced from S3. Please verify DATASET_S3_URI"
-        exit 1
-    fi
-# 3) HF_DATASET_ID
-elif [ -n "$HF_DATASET_ID" ]; then
-    RESOLVED_DATASET_DIR="${DATASET_LOCAL_DIR:-/workspace/train}"
-    echo "HF_DATASET_ID provided. Will download into: $RESOLVED_DATASET_DIR"
-    mkdir -p "$RESOLVED_DATASET_DIR"
-    HF_CLI=hf
-    if ! command -v "$HF_CLI" >/dev/null 2>&1; then
-        if command -v huggingface-cli >/dev/null 2>&1; then
-            HF_CLI=huggingface-cli
-        else
-            echo "ERROR: Could not find 'hf' or 'huggingface-cli'. Please ensure Hugging Face CLI is installed."
-            exit 1
-        fi
-    fi
-    echo "Downloading dataset $HF_DATASET_ID to $RESOLVED_DATASET_DIR using $HF_CLI ..."
-    if [ "$HF_CLI" = "hf" ]; then
-        if ! hf download --repo-type dataset "$HF_DATASET_ID" --local-dir "$RESOLVED_DATASET_DIR"; then
-            echo "ERROR: Failed to download Hugging Face dataset '$HF_DATASET_ID'. It may be missing, private, or your token lacks access."
-            exit 1
-        fi
+if [ "$NUM_NODES" -gt 1 ] && [ "$NODE_RANK" -ne 0 ]; then
+    # Worker nodes: use EFS shared path (container-local paths are not shared across nodes)
+    if [ -n "$DATASET_LOCAL_DIR" ] && [[ "$DATASET_LOCAL_DIR" == /mnt/efs/* ]]; then
+        RESOLVED_DATASET_DIR="$DATASET_LOCAL_DIR"
     else
-        if ! huggingface-cli download --repo-type dataset "$HF_DATASET_ID" --local-dir "$RESOLVED_DATASET_DIR"; then
-            echo "ERROR: Failed to download Hugging Face dataset '$HF_DATASET_ID'. It may be missing, private, or your token lacks access."
+        RESOLVED_DATASET_DIR="$MULTINODE_DATASET_DIR"
+    fi
+    echo "Worker node $NODE_RANK: will use shared dataset at $RESOLVED_DATASET_DIR"
+else
+    echo "[Step] Resolve dataset source (priority: local -> s3 -> hf -> sample)"
+
+    # 1) DATASET_LOCAL_DIR
+    if [ -n "$DATASET_LOCAL_DIR" ] && [ -d "$DATASET_LOCAL_DIR" ] && [ -n "$(ls -A "$DATASET_LOCAL_DIR" 2>/dev/null)" ]; then
+        if [ -n "$MULTINODE_DATASET_DIR" ] && [[ "$DATASET_LOCAL_DIR" != /mnt/efs/* ]]; then
+            # Multi-node but dataset is on container-local storage; copy to EFS
+            mkdir -p "$MULTINODE_DATASET_DIR"
+            cp -a "$DATASET_LOCAL_DIR"/. "$MULTINODE_DATASET_DIR"/
+            RESOLVED_DATASET_DIR="$MULTINODE_DATASET_DIR"
+            echo "Copied DATASET_LOCAL_DIR to shared EFS: $RESOLVED_DATASET_DIR"
+        else
+            RESOLVED_DATASET_DIR="$DATASET_LOCAL_DIR"
+            echo "Using DATASET_LOCAL_DIR: $RESOLVED_DATASET_DIR"
+        fi
+    # 2) DATASET_S3_URI
+    elif [ -n "$DATASET_S3_URI" ]; then
+        RESOLVED_DATASET_DIR="${MULTINODE_DATASET_DIR:-${DATASET_LOCAL_DIR:-/workspace/train}}"
+        echo "DATASET_S3_URI provided. Will sync into: $RESOLVED_DATASET_DIR"
+        mkdir -p "$RESOLVED_DATASET_DIR"
+        if ! command -v aws >/dev/null 2>&1; then
+            echo "ERROR: aws CLI is required to sync S3 dataset but was not found in PATH"
             exit 1
         fi
-    fi
-    if [ -z "$(ls -A "$RESOLVED_DATASET_DIR" 2>/dev/null)" ]; then
-        echo "ERROR: Dataset directory is empty after Hugging Face download: $RESOLVED_DATASET_DIR"
-        exit 1
-    fi
-# 4) Sample dataset via git clone with Git LFS
-else
-    echo "No dataset source provided. Attempting to use sample dataset via Git LFS..."
-    if ! command -v git >/dev/null 2>&1; then
-        echo "ERROR: git is required to clone the sample dataset"
-        exit 1
-    fi
-    if ! command -v git-lfs >/dev/null 2>&1; then
-        echo "git-lfs not found. Attempting to install..."
-        if command -v apt-get >/dev/null 2>&1; then
-            if ! apt-get update || ! apt-get install -y git-lfs; then
-                echo "ERROR: Failed to install git-lfs via apt-get."
+        echo "Syncing dataset from $DATASET_S3_URI to $RESOLVED_DATASET_DIR ..."
+        aws s3 sync "$DATASET_S3_URI" "$RESOLVED_DATASET_DIR" --no-progress
+        if [ -z "$(ls -A "$RESOLVED_DATASET_DIR" 2>/dev/null)" ]; then
+            echo "ERROR: No files synced from S3. Please verify DATASET_S3_URI"
+            exit 1
+        fi
+    # 3) HF_DATASET_ID
+    elif [ -n "$HF_DATASET_ID" ]; then
+        RESOLVED_DATASET_DIR="${MULTINODE_DATASET_DIR:-${DATASET_LOCAL_DIR:-/workspace/train}}"
+        echo "HF_DATASET_ID provided. Will download into: $RESOLVED_DATASET_DIR"
+        mkdir -p "$RESOLVED_DATASET_DIR"
+        HF_CLI=hf
+        if ! command -v "$HF_CLI" >/dev/null 2>&1; then
+            if command -v huggingface-cli >/dev/null 2>&1; then
+                HF_CLI=huggingface-cli
+            else
+                echo "ERROR: Could not find 'hf' or 'huggingface-cli'. Please ensure Hugging Face CLI is installed."
+                exit 1
+            fi
+        fi
+        echo "Downloading dataset $HF_DATASET_ID to $RESOLVED_DATASET_DIR using $HF_CLI ..."
+        if [ "$HF_CLI" = "hf" ]; then
+            if ! hf download --repo-type dataset "$HF_DATASET_ID" --local-dir "$RESOLVED_DATASET_DIR"; then
+                echo "ERROR: Failed to download Hugging Face dataset '$HF_DATASET_ID'. It may be missing, private, or your token lacks access."
                 exit 1
             fi
         else
-            echo "ERROR: git-lfs not found and automatic installation is unavailable on this system."
+            if ! huggingface-cli download --repo-type dataset "$HF_DATASET_ID" --local-dir "$RESOLVED_DATASET_DIR"; then
+                echo "ERROR: Failed to download Hugging Face dataset '$HF_DATASET_ID'. It may be missing, private, or your token lacks access."
+                exit 1
+            fi
+        fi
+        if [ -z "$(ls -A "$RESOLVED_DATASET_DIR" 2>/dev/null)" ]; then
+            echo "ERROR: Dataset directory is empty after Hugging Face download: $RESOLVED_DATASET_DIR"
             exit 1
         fi
-    fi
-    if ! git lfs install; then
-        echo "ERROR: 'git lfs install' failed. Please ensure git-lfs is configured correctly."
-        exit 1
-    fi
-    if [ ! -d "$SAMPLE_REPO_DIR/.git" ]; then
-        if ! git clone https://github.com/aws-samples/sample-embodied-ai-platform.git "$SAMPLE_REPO_DIR"; then
-            echo "ERROR: Failed to clone sample repository to $SAMPLE_REPO_DIR"
-            exit 1
-        fi
-    fi
-    if [ -d "$SAMPLE_REPO_DIR" ]; then
-        if ! (cd "$SAMPLE_REPO_DIR" && git lfs pull); then
-            echo "ERROR: 'git lfs pull' failed in $SAMPLE_REPO_DIR. Ensure LFS files are accessible."
-            exit 1
-        fi
-    fi
-    if [ -d "$DEFAULT_SAMPLE_DATASET_DIR" ] && [ -n "$(ls -A "$DEFAULT_SAMPLE_DATASET_DIR" 2>/dev/null)" ]; then
-        RESOLVED_DATASET_DIR="$DEFAULT_SAMPLE_DATASET_DIR"
-        echo "Using sample dataset at: $RESOLVED_DATASET_DIR"
+    # 4) Sample dataset via git clone with Git LFS
     else
-        echo "ERROR: Failed to prepare sample dataset. Please provide DATASET_LOCAL_DIR / DATASET_S3_URI / HF_DATASET_ID"
-        exit 1
+        echo "No dataset source provided. Attempting to use sample dataset via Git LFS..."
+        if ! command -v git >/dev/null 2>&1; then
+            echo "ERROR: git is required to clone the sample dataset"
+            exit 1
+        fi
+        if ! command -v git-lfs >/dev/null 2>&1; then
+            echo "git-lfs not found. Attempting to install..."
+            if command -v apt-get >/dev/null 2>&1; then
+                if ! apt-get update || ! apt-get install -y git-lfs; then
+                    echo "ERROR: Failed to install git-lfs via apt-get."
+                    exit 1
+                fi
+            else
+                echo "ERROR: git-lfs not found and automatic installation is unavailable on this system."
+                exit 1
+            fi
+        fi
+        if ! git lfs install; then
+            echo "ERROR: 'git lfs install' failed. Please ensure git-lfs is configured correctly."
+            exit 1
+        fi
+        if [ ! -d "$SAMPLE_REPO_DIR/.git" ]; then
+            if ! git clone https://github.com/aws-samples/sample-embodied-ai-platform.git "$SAMPLE_REPO_DIR"; then
+                echo "ERROR: Failed to clone sample repository to $SAMPLE_REPO_DIR"
+                exit 1
+            fi
+        fi
+        if [ -d "$SAMPLE_REPO_DIR" ]; then
+            if ! (cd "$SAMPLE_REPO_DIR" && git lfs pull); then
+                echo "ERROR: 'git lfs pull' failed in $SAMPLE_REPO_DIR. Ensure LFS files are accessible."
+                exit 1
+            fi
+        fi
+        if [ -d "$DEFAULT_SAMPLE_DATASET_DIR" ] && [ -n "$(ls -A "$DEFAULT_SAMPLE_DATASET_DIR" 2>/dev/null)" ]; then
+            if [ -n "$MULTINODE_DATASET_DIR" ]; then
+                # Multi-node: copy sample dataset to EFS so worker nodes can access it
+                mkdir -p "$MULTINODE_DATASET_DIR"
+                cp -a "$DEFAULT_SAMPLE_DATASET_DIR"/. "$MULTINODE_DATASET_DIR"/
+                RESOLVED_DATASET_DIR="$MULTINODE_DATASET_DIR"
+                echo "Copied sample dataset to shared EFS: $RESOLVED_DATASET_DIR"
+            else
+                RESOLVED_DATASET_DIR="$DEFAULT_SAMPLE_DATASET_DIR"
+                echo "Using sample dataset at: $RESOLVED_DATASET_DIR"
+            fi
+        else
+            echo "ERROR: Failed to prepare sample dataset. Please provide DATASET_LOCAL_DIR / DATASET_S3_URI / HF_DATASET_ID"
+            exit 1
+        fi
     fi
 fi
 
 # Export back so Python workflow picks up the resolved dataset dir
 export DATASET_LOCAL_DIR="$RESOLVED_DATASET_DIR"
+
+# Multi-node synchronization: main node signals dataset readiness via flag file on EFS.
+# Worker nodes wait until this flag exists before proceeding to training.
+if [ "$NUM_NODES" -gt 1 ]; then
+    READY_FLAG="${OUTPUT_DIR}/.dataset_ready"
+    if [ "$NODE_RANK" -eq 0 ]; then
+        touch "$READY_FLAG"
+        echo "Main node: dataset ready flag written at $READY_FLAG"
+    else
+        echo "Worker node $NODE_RANK: waiting for dataset ready signal..."
+        WAIT_SECONDS=0
+        MAX_WAIT=600
+        while [ ! -f "$READY_FLAG" ]; do
+            sleep 5
+            WAIT_SECONDS=$((WAIT_SECONDS + 5))
+            if [ "$WAIT_SECONDS" -ge "$MAX_WAIT" ]; then
+                echo "ERROR: Timed out waiting for main node dataset readiness ($MAX_WAIT s)"
+                exit 1
+            fi
+        done
+        echo "Worker node $NODE_RANK: dataset ready (waited ${WAIT_SECONDS}s)"
+    fi
+fi
 
 # Set PYTHONPATH to ensure proper imports
 export PYTHONPATH="/workspace/gr00t-repo:/workspace:${PYTHONPATH}"
@@ -285,6 +349,15 @@ python /workspace/scripts/finetune_gr00t.py
 
 # Make output files accessible to non-root users (Batch runs as root, DCV user is ubuntu)
 chmod -R a+rw "$OUTPUT_DIR" 2>/dev/null || true
+
+# Only main node handles upload and cleanup in multi-node setup
+if [ "$NUM_NODES" -gt 1 ] && [ "$NODE_RANK" -ne 0 ]; then
+    echo "Worker node $NODE_RANK: training complete. Skipping upload/cleanup (main node handles it)."
+    echo "=========================================="
+    echo "Fine-tuning Workflow Completed Successfully!"
+    echo "=========================================="
+    exit 0
+fi
 
 echo "[Step] Post-training: model upload and cleanup"
 

@@ -15,6 +15,7 @@ export interface BatchJobDefinitionProps {
 export class BatchJobDefinition extends Construct {
   public readonly jobQueue: batch.JobQueue;
   public readonly jobDefinition: batch.EcsJobDefinition;
+  public readonly multiNodeJobDefinition: batch.MultiNodeJobDefinition;
 
   constructor(scope: Construct, id: string, props: BatchJobDefinitionProps) {
     super(scope, id);
@@ -38,32 +39,33 @@ export class BatchJobDefinition extends Construct {
       ],
     });
 
-    // Container definition for each node (1 GPU per node)
+    const baseEnvironment = {
+      MAX_STEPS: '6000',
+      SAVE_STEPS: '2000',
+      GLOBAL_BATCH_SIZE: '32',
+      LEARNING_RATE: '1e-4',
+      GRADIENT_ACCUMULATION_STEPS: '1',
+      BASE_MODEL_PATH: 'nvidia/GR00T-N1.6-3B',
+      EMBODIMENT_TAG: 'new_embodiment',
+      MODALITY_CONFIG_PATH: '/workspace/scripts/so101_modality_config.py',
+      TUNE_LLM: 'false',
+      TUNE_VISUAL: 'false',
+      TUNE_PROJECTOR: 'true',
+      TUNE_DIFFUSION_MODEL: 'true',
+      OUTPUT_DIR: '/mnt/efs/gr00t/checkpoints',
+      UPLOAD_TARGET: 'none',
+      REPORT_TO: 'tensorboard',
+      NCCL_SOCKET_IFNAME: 'eth0',
+    };
+
+    // --- Single-node Job Definition (1 GPU) ---
     const container = new batch.EcsEc2ContainerDefinition(this, 'Container', {
       image: ecs.ContainerImage.fromEcrRepository(props.repository, 'latest'),
       memory: cdk.Size.gibibytes(64),
       cpu: 8,
       gpu: 1,
       jobRole,
-      environment: {
-        MAX_STEPS: '6000',
-        SAVE_STEPS: '2000',
-        NUM_GPUS: '1',
-        NUM_NODES: '1',
-        GLOBAL_BATCH_SIZE: '32',
-        LEARNING_RATE: '1e-4',
-        GRADIENT_ACCUMULATION_STEPS: '1',
-        BASE_MODEL_PATH: 'nvidia/GR00T-N1.6-3B',
-        EMBODIMENT_TAG: 'new_embodiment',
-        MODALITY_CONFIG_PATH: '/workspace/scripts/so101_modality_config.py',
-        TUNE_LLM: 'false',
-        TUNE_VISUAL: 'false',
-        TUNE_PROJECTOR: 'true',
-        TUNE_DIFFUSION_MODEL: 'true',
-        UPLOAD_TARGET: 'none',
-        REPORT_TO: 'tensorboard',
-        NCCL_SOCKET_IFNAME: 'eth0',
-      },
+      environment: { ...baseEnvironment, NUM_GPUS: '1', NUM_NODES: '1' },
     });
 
     this.jobDefinition = new batch.EcsJobDefinition(this, 'JobDef', {
@@ -73,33 +75,58 @@ export class BatchJobDefinition extends Construct {
       retryAttempts: 1,
     });
 
-    // Add EFS volume + mount + shared memory via L1 escape hatch
     const cfnJobDef = this.jobDefinition.node.defaultChild as cdk.CfnResource;
     cfnJobDef.addPropertyOverride(
       'ContainerProperties.Volumes',
-      [
-        {
-          Name: 'efs-volume',
-          EfsVolumeConfiguration: {
-            FileSystemId: props.efsFileSystemId,
-            RootDirectory: '/',
-            TransitEncryption: 'ENABLED',
-          },
-        },
-      ],
+      [{ Name: 'efs-volume', EfsVolumeConfiguration: { FileSystemId: props.efsFileSystemId, RootDirectory: '/', TransitEncryption: 'ENABLED' } }],
     );
     cfnJobDef.addPropertyOverride(
       'ContainerProperties.MountPoints',
-      [
-        {
-          SourceVolume: 'efs-volume',
-          ContainerPath: '/mnt/efs',
-          ReadOnly: false,
-        },
-      ],
+      [{ SourceVolume: 'efs-volume', ContainerPath: '/mnt/efs', ReadOnly: false }],
     );
     cfnJobDef.addPropertyOverride(
       'ContainerProperties.LinuxParameters',
+      { SharedMemorySize: 65536 },
+    );
+
+    // --- Multi-node Job Definition (2 nodes × 1 GPU each) ---
+    const multiNodeContainer = new batch.EcsEc2ContainerDefinition(this, 'MultiNodeContainer', {
+      image: ecs.ContainerImage.fromEcrRepository(props.repository, 'latest'),
+      memory: cdk.Size.gibibytes(60),
+      cpu: 8,
+      gpu: 1,
+      jobRole,
+      environment: {
+        ...baseEnvironment,
+        NUM_GPUS: '1',
+        NUM_NODES: '2',
+        DATALOADER_NUM_WORKERS: '2',
+      },
+    });
+
+    this.multiNodeJobDefinition = new batch.MultiNodeJobDefinition(this, 'MultiNodeJobDef', {
+      jobDefinitionName: `${props.namePrefix}-GrootFinetuneMultiNodeJob`,
+      mainNode: 0,
+      propagateTags: true,
+      containers: [
+        { startNode: 0, endNode: 1, container: multiNodeContainer },
+      ],
+      timeout: cdk.Duration.hours(6),
+      retryAttempts: 1,
+    });
+
+    // Add EFS volume + mount + shared memory to multi-node via L1 escape hatch
+    const cfnMultiNodeJobDef = this.multiNodeJobDefinition.node.defaultChild as cdk.CfnResource;
+    cfnMultiNodeJobDef.addPropertyOverride(
+      'NodeProperties.NodeRangeProperties.0.Container.Volumes',
+      [{ Name: 'efs-volume', EfsVolumeConfiguration: { FileSystemId: props.efsFileSystemId, RootDirectory: '/', TransitEncryption: 'ENABLED' } }],
+    );
+    cfnMultiNodeJobDef.addPropertyOverride(
+      'NodeProperties.NodeRangeProperties.0.Container.MountPoints',
+      [{ SourceVolume: 'efs-volume', ContainerPath: '/mnt/efs', ReadOnly: false }],
+    );
+    cfnMultiNodeJobDef.addPropertyOverride(
+      'NodeProperties.NodeRangeProperties.0.Container.LinuxParameters',
       { SharedMemorySize: 65536 },
     );
   }
