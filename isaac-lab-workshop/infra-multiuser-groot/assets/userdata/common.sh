@@ -16,23 +16,43 @@ exec > >(tee /var/log/user-data.log) 2>&1
 echo "===== [$(date)] START: common.sh ====="
 
 # -----------------------------------------------------------------------------
-# 1. dpkg lock 해제 대기
-#    Ubuntu AMI 부팅 직후 unattended-upgrades가 dpkg lock을 잡고 있을 수 있다.
-#    lock이 해제될 때까지 최대 5분간 대기한다.
+# 1. apt/dpkg lock contention 방지
+#    DLAMI 부팅 직후 unattended-upgrades, apt.systemd.daily, apt.systemd.daily-upgrade가
+#    이미 apt-get을 실행해서 dpkg lock을 잡고 있다. 이 상태에서 common.sh가 설치를
+#    시도하면 "Could not get lock /var/lib/dpkg/lock-frontend" 에러가 나고 trap ERR이
+#    발동해서 USERDATA_EXIT=1로 플래그 세팅 → 최종 cfn-signal이 FAILURE가 된다.
+#
+#    완화책 3단계:
+#    (a) apt 관련 systemd 타이머/서비스를 완전 정지 + mask + 실행 중 프로세스 kill
+#    (b) 모든 apt/dpkg lock 파일이 free될 때까지 최대 10분 대기
+#    (c) 이후 apt-get 호출이 lock을 못 얻어도 자동으로 기다리도록 전역 config 설정
+#        (install-docker.sh, install-dcv.sh 등 외부 스크립트에도 적용)
 # -----------------------------------------------------------------------------
-echo "dpkg lock 해제 대기 중..."
-for i in $(seq 1 60); do
-  if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
-    echo "dpkg lock 해제 확인 (${i}회 시도)"
+echo "apt/dpkg 자동 업데이트 작업 정지 중..."
+systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
+systemctl disable apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
+systemctl mask apt-daily.service apt-daily-upgrade.service unattended-upgrades 2>/dev/null || true
+systemctl kill --kill-who=all apt-daily.service apt-daily-upgrade.service unattended-upgrades 2>/dev/null || true
+
+echo "apt/dpkg lock 해제 대기 중..."
+WAIT_MAX=120  # 120 × 5s = 10분
+for i in $(seq 1 $WAIT_MAX); do
+  if ! fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+              /var/lib/apt/lists/lock /var/cache/apt/archives/lock \
+              >/dev/null 2>&1; then
+    echo "apt/dpkg lock 해제 확인 (${i}회 시도)"
     break
   fi
-  echo "dpkg lock 사용 중... 5초 대기 (${i}/60)"
+  echo "apt/dpkg lock 사용 중... 5초 대기 (${i}/${WAIT_MAX})"
   sleep 5
 done
 
-# unattended-upgrades 비활성화 (이후 lock 충돌 방지)
-systemctl stop unattended-upgrades 2>/dev/null || true
-systemctl disable unattended-upgrades 2>/dev/null || true
+# 이후 모든 apt-get 호출이 lock을 최대 10분까지 자동 대기하도록 전역 설정.
+# 이 설정은 common.sh 이후 실행되는 install-dcv.sh, install-docker.sh 등
+# 외부 스크립트의 apt-get 호출에도 자동 적용된다.
+cat > /etc/apt/apt.conf.d/99-lock-timeout <<EOF
+DPkg::Lock::Timeout "600";
+EOF
 
 # -----------------------------------------------------------------------------
 # 1.5. AWS CLI v2 fallback 설치
