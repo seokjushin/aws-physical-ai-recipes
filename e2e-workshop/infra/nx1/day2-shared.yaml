@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NX1 Day2 SHARED (1회 배포) - GR00T fine-tune 공용 인프라 (Spec Appendix B).
+  SageMaker training/inference ECR(nx1/*) ×2 + 공용 CodeBuild role + build project ×2(NO_SOURCE)
+  + Studio Domain 기본 Notebook 실행롤. 변환 원본 groot-finetune-shared-stack.ts.
+  ⚠️ 제외: Batch(BatchEcr/BatchCodeBuild), StudioDomain 생성(기존 d-evroaqdzfcor 재사용 - per-user 템플릿이 파라미터로 받음).
+  배포: --role-arn CloudFormationDeployer --tags doosan:owner=BEST_NX1.
+
+Parameters:
+  TrainingRepoName:
+    Type: String
+    Default: nx1/groot-sm-training
+    AllowedPattern: '^nx1/.+'
+    Description: nx1/* 네이밍 필수 (BESTNX1-Deploy ECR 권한 스코프)
+  InferenceRepoName:
+    Type: String
+    Default: nx1/groot-sm-inference
+    AllowedPattern: '^nx1/.+'
+  GrootVersion:
+    Type: String
+    Default: n1.6
+  BaseModelPath:
+    Type: String
+    Default: nvidia/GR00T-N1.6-3B
+  CreateMlflow:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 공유 MLflow tracking server(SageMaker 관리형, 시간당 과금) 생성 여부.
+  MlflowSize:
+    Type: String
+    Default: Small
+    AllowedValues: [Small, Medium, Large]
+
+Conditions:
+  WantMlflow: !Equals [!Ref CreateMlflow, 'true']
+
+Resources:
+  # ---------- SageMaker ECR ×2 (nx1/*) ----------
+  TrainingRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref TrainingRepoName
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 5 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}
+
+  InferenceRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref InferenceRepoName
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 5 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}
+
+  # ---------- 공용 CodeBuild 서비스 롤 (S3는 nx1/dibh 버킷 한정 - B.1) ----------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nx1-GR00TCodeBuildRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: nx1-codebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: '*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/groot-sm-*
+              - Sid: S3BuildSourceNx1Only
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource:
+                  - arn:aws:s3:::nx1-*/codebuild-source/*
+                  - arn:aws:s3:::dibh-737138011740-*/codebuild-source/*
+
+  TrainingBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/groot-sm-training-build
+      RetentionInDays: 30
+
+  InferenceBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/groot-sm-inference-build
+      RetentionInDays: 30
+
+  TrainingBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: groot-sm-training-build
+      Description: GR00T training container build and ECR push
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo "NO_SOURCE: upload source zip to S3 then trigger build (scripts/trigger_build.py)"
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_LARGE
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ECR_REGISTRY, Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com' }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref 'AWS::Region' }
+          - { Name: IMAGE_REPO, Value: !Ref TrainingRepoName }
+          - { Name: GROOT_VERSION, Value: !Ref GrootVersion }
+          - { Name: USE_STABLE, Value: 'true' }
+          - { Name: BASE_MODEL_PATH, Value: !Ref BaseModelPath }
+          - { Name: IMAGE_TAG, Value: latest }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: /aws/codebuild/groot-sm-training-build
+
+  InferenceBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: groot-sm-inference-build
+      Description: GR00T inference container build and ECR push
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo "NO_SOURCE: upload source zip to S3 then trigger build (scripts/trigger_build.py)"
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_LARGE
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: ECR_REGISTRY, Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com' }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref 'AWS::Region' }
+          - { Name: IMAGE_REPO, Value: !Ref InferenceRepoName }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: /aws/codebuild/groot-sm-inference-build
+
+  # ---------- Studio Domain 기본 Notebook 실행롤 (CDK-ism 제거 - B.1) ----------
+  # ⚠️ 원본 NotebookRole의 cdk-bootstrap SSM 파라미터 + sts:AssumeRole arn:...role/cdk-* 삭제.
+  DefaultNotebookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nx1-GR00TNotebookRoleDefault
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: nx1-notebook
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CodeBuildManage
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:BatchGetProjects
+                  - codebuild:ListBuildsForProject
+                Resource:
+                  - !GetAtt TrainingBuildProject.Arn
+                  - !GetAtt InferenceBuildProject.Arn
+              - Sid: EcrNx1
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:CreateRepository
+                Resource: '*'
+              - Sid: SsmGrootParams
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:PutParameter, ssm:DescribeParameters]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/groot/*
+              - Sid: PassRoleToServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: [sagemaker.amazonaws.com, codebuild.amazonaws.com]
+              - Sid: MlflowAndLogs
+                Effect: Allow
+                Action:
+                  - sagemaker-mlflow:*
+                  - sagemaker:DescribeMlflowTrackingServer
+                  - sagemaker:CreatePresignedMlflowTrackingServerUrl
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: SageMakerNotebook
+
+  # ---------- 공유 MLflow (SageMaker 관리형) ----------
+  MlflowArtifactBucket:
+    Type: AWS::S3::Bucket
+    Condition: WantMlflow
+    Properties:
+      BucketName: !Sub nx1-groot-mlflow-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  MlflowRole:
+    Type: AWS::IAM::Role
+    Condition: WantMlflow
+    Properties:
+      RoleName: nx1-groot-mlflow-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: mlflow-artifact-s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt MlflowArtifactBucket.Arn
+                  - !Sub '${MlflowArtifactBucket.Arn}/*'
+
+  MlflowTrackingServer:
+    Type: AWS::SageMaker::MlflowTrackingServer
+    Condition: WantMlflow
+    DependsOn: MlflowArtifactBucket
+    Properties:
+      TrackingServerName: nx1-groot-mlflow
+      TrackingServerSize: !Ref MlflowSize
+      ArtifactStoreUri: !Sub s3://nx1-groot-mlflow-${AWS::AccountId}/mlflow-artifacts
+      RoleArn: !GetAtt MlflowRole.Arn
+      AutomaticModelRegistration: false
+
+Outputs:
+  TrainingRepoUri:
+    Value: !GetAtt TrainingRepo.RepositoryUri
+    Export: { Name: nx1-groot-shared-TrainingRepoUri }
+  InferenceRepoUri:
+    Value: !GetAtt InferenceRepo.RepositoryUri
+    Export: { Name: nx1-groot-shared-InferenceRepoUri }
+  TrainingRepoName:
+    Value: !Ref TrainingRepoName
+    Export: { Name: nx1-groot-shared-TrainingRepoName }
+  InferenceRepoName:
+    Value: !Ref InferenceRepoName
+    Export: { Name: nx1-groot-shared-InferenceRepoName }
+  TrainingBuildProjectName:
+    Value: !Ref TrainingBuildProject
+  InferenceBuildProjectName:
+    Value: !Ref InferenceBuildProject
+  DefaultNotebookRoleArn:
+    Value: !GetAtt DefaultNotebookRole.Arn
+    Export: { Name: nx1-groot-shared-DefaultNotebookRoleArn }
+  MlflowTrackingServerArn:
+    Condition: WantMlflow
+    Value: !GetAtt MlflowTrackingServer.TrackingServerArn
+    Export: { Name: nx1-groot-shared-MlflowArn }
+  MlflowTrackingServerName:
+    Condition: WantMlflow
+    Value: nx1-groot-mlflow

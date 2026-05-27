@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NX1 Day1 - Isaac Lab GPU + NICE DCV + per-user EFS (Spec Appendix A).
+  plain EC2(no ASG), private SubnetApp, inbound 0 SG, DCV-over-SSM(no public IP),
+  per-user EFS, idle self-stop, least-privilege role, UserData M1 patch + CreationPolicy PT90M.
+  변환 원본: isaaclab/lib/constructs/{dcv-instance,efs-storage}.ts (networking/batch/cloudfront/code-server 제외).
+  배포: aws cloudformation deploy/create-stack --role-arn CloudFormationDeployer --tags doosan:owner=BEST_NX1.
+
+Parameters:
+  UserId:
+    Type: String
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: 소문자/숫자/하이픈만 (스택명·ECR repo·Name 태그에 사용). 어기면 ECR push silently 실패.
+  InstanceType:
+    Type: String
+    Default: g6.4xlarge
+    AllowedValues: [g6.4xlarge, g6e.4xlarge]
+    Description: 기본 g6.4xlarge (5/14 가용 확인). capacity 부족 시 g6e.4xlarge 또는 SubnetId 변경.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0ba18fea83615b131
+    Description: 공유 VPC (Networking 계정 소유)
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0824e676b789f5f5d
+    Description: SubnetAppA(1a, private). capacity 실패 시 subnet-09db5ca35015f76e3(AppB,1b)로 변경(F6)
+  AmiId:
+    Type: String
+    Default: ami-0aee7b90d684e107d
+    Description: DLAMI Ubuntu 22.04 PyTorch 2.4.1 (us-east-1, stable 프로필). 24.04는 ami-0aad28499825d76c3.
+  ScriptsZipUrl:
+    Type: String
+    Description: >
+      UserData/idle/prepatch 스크립트 + workshop/ 에셋 zip의 S3 URL
+      (s3://dibh-737138011740-us-east-1-cloudformation/nx1/day1/userdata-<ver>.zip). build-and-stage.sh가 생성.
+  KmsKeyArn:
+    Type: String
+    Default: ''
+    Description: EBS/EFS 암호화용 CMK ARN (예 db-best-nx1-core-settings-KmsDataKey). 비우면 AWS 관리형 키(F11 회피).
+  IdleMinutes:
+    Type: Number
+    Default: 120
+    Description: 무활동 자가 stop 임계(분). 멤버 재시작 불가 → runbook "한 번에 완료" 경고.
+  NvidiaDriverVersion:
+    Type: String
+    Default: '570'
+  IsaacSimVersion:
+    Type: String
+    Default: '4.5.0'
+  Ros2Distro:
+    Type: String
+    Default: humble
+  VersionProfileName:
+    Type: String
+    Default: stable
+
+Conditions:
+  UseCustomKms: !Not [!Equals [!Ref KmsKeyArn, '']]
+
+Resources:
+  # --- 인스턴스 SG: 인바운드 0, egress all (DCV는 SSM 포트포워딩) ---
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NX1 Day1 IsaacLab instance - egress only, no inbound (DCV via SSM port-forward)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: all egress via shared NAT to Cloud One
+      Tags:
+        - Key: Name
+          Value: !Sub nx1-isaaclab-${UserId}-sg
+
+  # --- EFS SG: NFS 2049 인바운드는 인스턴스 SG에서만 (VPC CIDR 아님 - A.6) ---
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NX1 Day1 EFS - NFS 2049 inbound from instance SG only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup
+          Description: NFS from this stack instance SG only
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: all egress
+      Tags:
+        - Key: Name
+          Value: !Sub nx1-isaaclab-${UserId}-efs-sg
+
+  Efs:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+      KmsKeyId: !If [UseCustomKms, !Ref KmsKeyArn, !Ref 'AWS::NoValue']
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub nx1-isaaclab-${UserId}-efs
+
+  EfsMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref Efs
+      SubnetId: !Ref SubnetId
+      SecurityGroups: [!Ref EfsSecurityGroup]
+
+  DcvSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub DCV login password for nx1-isaaclab-${UserId}
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"ubuntu"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+        IncludeSpace: false
+      Tags:
+        - Key: Name
+          Value: !Sub nx1-isaaclab-${UserId}-secret
+        - Key: doosan:owner
+          Value: BEST_NX1
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nx1-isaaclab-${UserId}-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: nx1-isaaclab-least-priv
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DCV 비밀번호
+              - Sid: DcvSecretRead
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DcvSecret
+              # UserData/workshop 스크립트 zip (dibh 아티팩트 버킷)
+              - Sid: ScriptsRead
+                Effect: Allow
+                Action: [s3:GetObject]
+                Resource:
+                  - arn:aws:s3:::dibh-737138011740-us-east-1-cloudformation/*
+                  - arn:aws:s3:::dibh-bestnx1-cloudformation/*
+              - Sid: BuildLogWrite  # [INSTRUMENT] 빌드 로그 스트리밍
+                Effect: Allow
+                Action: [s3:PutObject]
+                Resource: arn:aws:s3:::dibh-737138011740-us-east-1-cloudformation/day1-buildlog/*
+              # ECR: isaac-lab.sh가 nx1/isaaclab-<userId> 생성+push
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushNx1
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DescribeRepositories
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/nx1/*
+              # SSM Session Manager가 alias/ssm/logging 키로 세션 KMS 암호화를 강제 →
+              # 인스턴스 역할에 Decrypt/GenerateDataKey 없으면 모든 세션이 핸드셰이크에서 실패.
+              - Sid: SsmSessionKms
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: arn:aws:kms:us-east-1:737138011740:key/c52d7d43-b0f7-401a-981e-51976e09483a
+              # idle 자가 stop (자기 스택 인스턴스 한정 - A.5)
+              - Sid: SelfStop
+                Effect: Allow
+                Action: ec2:StopInstances
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    'ec2:ResourceTag/aws:cloudformation:stack-name': !Ref 'AWS::StackName'
+              # CMK 지정 시에만 (F11)
+              - !If
+                - UseCustomKms
+                - Sid: KmsUse
+                  Effect: Allow
+                  Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                  Resource: !Ref KmsKeyArn
+                - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Name
+          Value: !Sub nx1-isaaclab-${UserId}-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  DcvInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: EfsMountTarget
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT3H  # [INSTRUMENT] 진단용 상향(원래 PT90M) — 완주시켜 per-step 시간 측정. idle auto-stop이 비용 캡.
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref InstanceSecurityGroup]
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 300
+            VolumeType: gp3
+            Encrypted: true
+            KmsKeyId: !If [UseCustomKms, !Ref KmsKeyArn, !Ref 'AWS::NoValue']
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub nx1-isaaclab-${UserId}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -v
+          export NVIDIA_DRIVER_VERSION="${NvidiaDriverVersion}"
+          export ISAAC_SIM_VERSION="${IsaacSimVersion}"
+          export ROS2_DISTRO="${Ros2Distro}"
+          export VERSION_PROFILE="${VersionProfileName}"
+          export EFS_ID="${Efs}"
+          export REGION="${AWS::Region}"
+          export ACCOUNT="${AWS::AccountId}"
+          export SECRET_ID="${DcvSecret}"
+          export ECR_REPO_NAME="nx1/isaaclab-${UserId}"
+          export IDLE_MINUTES="${IdleMinutes}"
+
+          # IMDS/네트워크 준비 대기 후 S3 접근
+          for i in $(seq 1 30); do
+            TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null) \
+              && curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/ >/dev/null 2>&1 \
+              && break
+            echo "Waiting for IMDS credentials ($i/30)..."; sleep 10
+          done
+
+          # [INSTRUMENT] 빌드 로그를 60초마다 S3로 스트리밍 → 롤백돼도 타임라인 보존
+          export IID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null)
+          export LOGBUCKET="dibh-737138011740-us-east-1-cloudformation"
+          export LOGREGION="${AWS::Region}"
+          ( while true; do
+              { echo "==== buildlog snapshot $(date -u +%T) ===="; cat /var/log/cloud-init-output.log /var/log/user-data.log; } > /tmp/bl.txt 2>/dev/null
+              aws s3 cp /tmp/bl.txt "s3://$LOGBUCKET/day1-buildlog/$IID.log" --region "$LOGREGION" >/dev/null 2>&1
+              sleep 60
+            done ) &
+
+          echo "### TIMING boot bootstrap-start $(date -u +%T)"
+          aws s3 cp "${ScriptsZipUrl}" /tmp/nx1-scripts.zip
+          mkdir -p /tmp/nx1-scripts
+          unzip -o /tmp/nx1-scripts.zip -d /tmp/nx1-scripts
+          chmod +x /tmp/nx1-scripts/*.sh || true
+          # workshop 에셋을 isaac-lab.sh가 기대하는 /tmp 경로로 복사
+          cp /tmp/nx1-scripts/workshop/Dockerfile /tmp/workshop-dockerfile
+          cp /tmp/nx1-scripts/workshop/distributed_run.bash /tmp/workshop-distributed-run
+
+          USERDATA_EXIT=0
+          trap 'USERDATA_EXIT=1' ERR
+          set -o pipefail
+
+          # NX1 M1 패치(apt lock/timer/rosdep)를 가장 먼저. [INSTRUMENT] 단계별 타임스탬프.
+          echo "### TIMING prepatch START $(date -u +%T)"; source /tmp/nx1-scripts/nx1-prepatch.sh; echo "### TIMING prepatch END $(date -u +%T)"
+          echo "### TIMING common START $(date -u +%T)"; source /tmp/nx1-scripts/common.sh; echo "### TIMING common END $(date -u +%T)"
+          echo "### TIMING nvidia START $(date -u +%T)"; source /tmp/nx1-scripts/nvidia-driver.sh; echo "### TIMING nvidia END $(date -u +%T)"
+          echo "### TIMING isaac-lab START $(date -u +%T)"; source /tmp/nx1-scripts/isaac-lab.sh; echo "### TIMING isaac-lab END $(date -u +%T)"
+          echo "### TIMING efs-mount START $(date -u +%T)"; source /tmp/nx1-scripts/efs-mount.sh; echo "### TIMING efs-mount END $(date -u +%T)"
+          echo "### TIMING idle-install START $(date -u +%T)"; source /tmp/nx1-scripts/nx1-idle-autostop-install.sh; echo "### TIMING idle-install END $(date -u +%T)"
+          echo "### TIMING all-steps-done $(date -u +%T)"
+
+          trap - ERR
+          set +e
+          wget https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.zip
+          unzip aws-cfn-bootstrap-py3-latest.zip
+          cd aws-cfn-bootstrap-2.0/
+          python3 setup.py install
+          /usr/local/bin/cfn-signal -e $USERDATA_EXIT --stack ${AWS::StackName} --resource DcvInstance --region ${AWS::Region}
+
+          systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true
+          reboot
+
+Outputs:
+  InstanceId:
+    Value: !Ref DcvInstance
+  DcvSecretArn:
+    Description: DCV 비밀번호 (콘솔 Secrets Manager에서 조회)
+    Value: !Ref DcvSecret
+  EfsId:
+    Value: !Ref Efs
+  PortForwardCmd:
+    Description: 로컬에서 DCV 접속 (SSM 포트포워딩 8443) 후 https://localhost:8443
+    Value: !Sub >-
+      aws ssm start-session --target ${DcvInstance}
+      --document-name AWS-StartPortForwardingSession
+      --parameters portNumber=8443,localPortNumber=8443
+      --region ${AWS::Region} --profile BESTNX1-Developer-737138011740
+  SsmShellCmd:
+    Description: CLI 핸즈온 (브라우저 셸 대안)
+    Value: !Sub aws ssm start-session --target ${DcvInstance} --region ${AWS::Region} --profile BESTNX1-Developer-737138011740

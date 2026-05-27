@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  F4 격리 테스트 - 기존 nx1 Studio 도메인(SSO)에 NX1 CFN만으로 UserProfile이 생성되는지 확인.
+  최소 자원(실행롤 1 + UserProfile 1). 결과 확인 후 즉시 delete-stack.
+  SsoUserValue 비움 = SSO 매핑 없이 생성 시도(SSO 도메인이 거부하면 F4 확정).
+
+Parameters:
+  UserId:
+    Type: String
+    Default: f4test
+    AllowedPattern: '^[a-z0-9-]+$'
+  StudioDomainId:
+    Type: String
+    Default: d-evroaqdzfcor
+  SsoUserValue:
+    Type: String
+    Default: ''
+    Description: 비우면 SSO 매핑 없이 시도. 채우면 SingleSignOnUserIdentifier=UserName 매핑.
+
+Conditions:
+  HasSso: !Not [!Equals [!Ref SsoUserValue, '']]
+
+Resources:
+  TestNotebookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nx1-f4test-notebook-${UserId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+
+  TestUserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !Ref StudioDomainId
+      UserProfileName: !Ref UserId
+      SingleSignOnUserIdentifier: !If [HasSso, 'UserName', !Ref 'AWS::NoValue']
+      SingleSignOnUserValue: !If [HasSso, !Ref SsoUserValue, !Ref 'AWS::NoValue']
+      UserSettings:
+        ExecutionRole: !GetAtt TestNotebookRole.Arn
+
+Outputs:
+  UserProfileName:
+    Value: !Ref UserId

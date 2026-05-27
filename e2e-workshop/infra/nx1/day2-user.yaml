@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NX1 Day2 PER-USER - GR00T fine-tune per-user 리소스 (Spec Appendix B).
+  S3 아티팩트 버킷(nx1/*, BPA+암호화+버전) + SageMaker 실행롤 + per-user Notebook롤
+  + 기존 Studio 도메인(d-evroaqdzfcor) user-profile + (옵션)MLflow. 변환 원본 groot-sagemaker-stack.ts.
+  ⚠️ 제외: StudioDomain 생성(기존 재사용), deploy-endpoint Lambda(기본 ZMQ-local 평가 - B.1).
+  ⚠️ F4: 기존 도메인은 SSO 인증 → user-profile에 IdC 사용자 매핑(SsoUserValue) 필요 가능(관리계정 의존).
+  ⚠️ I1: 학습은 SageMaker Training Job을 --no-spot(On-Demand) + VpcConfig 미설정(Cloud One 우회)으로 실행.
+
+Parameters:
+  UserId:
+    Type: String
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: 참가자 식별자 (소문자/숫자/하이픈). user-profile 이름·버킷·롤에 사용.
+  StudioDomainId:
+    Type: String
+    Default: d-evroaqdzfcor
+    Description: 기존 nx1 Studio 도메인 (신규 생성 안 함)
+  SsoUserValue:
+    Type: String
+    Default: ''
+    Description: >
+      SSO 도메인용 IdC 사용자명(예 AD ID). 비우면 SSO 매핑 없이 생성 시도(SSO 도메인에선 실패 가능 - F4).
+      채우면 SingleSignOnUserIdentifier=UserName + 이 값으로 매핑.
+  KmsKeyArn:
+    Type: String
+    Default: ''
+    Description: S3 SSE-KMS용 CMK ARN(db-best-nx1-core-settings-KmsDataKey). 비우면 SSE-S3(AES256) (F7/F11).
+  CreateMlflow:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: MLflow tracking server 생성 여부(상시 비용). run_training.py MLflow 로깅 쓸 때만 true.
+  TrainingRepoName:
+    Type: String
+    Default: nx1/groot-sm-training
+
+Conditions:
+  UseCustomKms: !Not [!Equals [!Ref KmsKeyArn, '']]
+  HasSso: !Not [!Equals [!Ref SsoUserValue, '']]
+  WantMlflow: !Equals [!Ref CreateMlflow, 'true']
+
+Resources:
+  # ---------- [1] S3 아티팩트 버킷 (nx1/*, BPA+암호화+버전 - F7) ----------
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nx1-groot-${UserId}-${AWS::AccountId}
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomKms, 'aws:kms', 'AES256']
+              KMSMasterKeyID: !If [UseCustomKms, !Ref KmsKeyArn, !Ref 'AWS::NoValue']
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupCheckpoints
+            Status: Enabled
+            Prefix: checkpoints/
+            ExpirationInDays: 30
+          - Id: ArchiveOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 365
+            NoncurrentVersionTransitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+
+  # ---------- [2] SageMaker 학습/추론 실행롤 ----------
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nx1-GR00TSageMakerRole-${UserId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: nx1-sm-exec
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Bucket
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              - Sid: SsmGrootRead
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/groot/*
+              - Sid: EcrPull
+                Effect: Allow
+                Action: [ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability]
+                Resource: '*'
+              - Sid: Mlflow
+                Effect: Allow
+                Action: [sagemaker-mlflow:*, sagemaker:DescribeMlflowTrackingServer]
+                Resource: '*'
+              - !If
+                - UseCustomKms
+                - Sid: KmsUse
+                  Effect: Allow
+                  Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+                  Resource: !Ref KmsKeyArn
+                - !Ref 'AWS::NoValue'
+
+  # ---------- [3] per-user Notebook 실행롤 (CDK-ism 제거 - B.1) ----------
+  NotebookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nx1-GR00TNotebookRole-${UserId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: nx1-notebook
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Bucket
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              - Sid: CodeBuildManage
+                Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:StopBuild, codebuild:BatchGetBuilds, codebuild:BatchGetProjects, codebuild:ListBuildsForProject]
+                Resource: !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/groot-sm-*
+              - Sid: EcrNx1
+                Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage, ecr:DescribeRepositories, ecr:DescribeImages, ecr:ListImages]
+                Resource: '*'
+              - Sid: PassRoleToServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt SageMakerRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: [sagemaker.amazonaws.com, codebuild.amazonaws.com]
+              - Sid: SsmGroot
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:GetParameters, ssm:PutParameter, ssm:DescribeParameters]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/groot/*
+              - Sid: MlflowAndLogs
+                Effect: Allow
+                Action: [sagemaker-mlflow:*, sagemaker:DescribeMlflowTrackingServer, sagemaker:CreatePresignedMlflowTrackingServerUrl, logs:DescribeLogGroups, logs:DescribeLogStreams, logs:GetLogEvents, logs:FilterLogEvents]
+                Resource: '*'
+
+  # ---------- [4] CloudWatch Log Group (학습) ----------
+  SageMakerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/sagemaker/groot-sm-${UserId}
+      RetentionInDays: 30
+
+  # ---------- [5] Studio user-profile (기존 도메인) ----------
+  StudioUserProfile:
+    Type: AWS::SageMaker::UserProfile
+    Properties:
+      DomainId: !Ref StudioDomainId
+      UserProfileName: !Ref UserId
+      SingleSignOnUserIdentifier: !If [HasSso, 'UserName', !Ref 'AWS::NoValue']
+      SingleSignOnUserValue: !If [HasSso, !Ref SsoUserValue, !Ref 'AWS::NoValue']
+      UserSettings:
+        ExecutionRole: !GetAtt NotebookRole.Arn
+
+  # ---------- [6] (옵션) MLflow tracking server ----------
+  MlflowTrackingServer:
+    Type: AWS::SageMaker::MlflowTrackingServer
+    Condition: WantMlflow
+    DependsOn: ArtifactsBucket
+    Properties:
+      TrackingServerName: !Sub nx1-groot-mlflow-${UserId}
+      ArtifactStoreUri: !Sub s3://nx1-groot-${UserId}-${AWS::AccountId}/mlflow-artifacts
+      RoleArn: !GetAtt SageMakerRole.Arn
+      TrackingServerSize: Small
+      AutomaticModelRegistration: false
+
+Outputs:
+  BucketName:
+    Value: !Ref ArtifactsBucket
+  SageMakerRoleArn:
+    Value: !GetAtt SageMakerRole.Arn
+  NotebookRoleArn:
+    Value: !GetAtt NotebookRole.Arn
+  StudioUserProfileName:
+    Value: !Ref UserId
+  MlflowArn:
+    Condition: WantMlflow
+    Value: !GetAtt MlflowTrackingServer.TrackingServerArn

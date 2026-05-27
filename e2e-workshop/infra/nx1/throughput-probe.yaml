@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NX1 Cloud One egress THROUGHPUT probe (RCA H1) - private 서브넷에서 실제 빌드 경로
+  (pythonhosted pip / HuggingFace LFS-CDN)로 대용량 다운로드 MB/s 실측. 결과 S3 업로드 후 delete-stack.
+  네트워크 베이스라인 충분한 c5.large 사용(인스턴스 NIC 병목 배제).
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0824e676b789f5f5d
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0ba18fea83615b131
+  InstanceType:
+    Type: String
+    Default: c5.large
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  ReportBucket:
+    Type: String
+    Default: dibh-737138011740-us-east-1-cloudformation
+
+Resources:
+  ProbeSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NX1 throughput probe egress only
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: all egress via shared NAT to Cloud One
+      Tags: [{ Key: Name, Value: nx1-throughput-probe-sg }]
+
+  ProbeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: ReportUpload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${ReportBucket}/throughput-probe/*
+
+  ProbeProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ProbeRole]
+
+  ProbeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref ProbeSG]
+      IamInstanceProfile: !Ref ProbeProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 20, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: nx1-throughput-probe }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          REPORT=/var/log/throughput-probe.log
+          exec > >(tee "$REPORT") 2>&1
+          echo "===== NX1 THROUGHPUT PROBE $(date -u) ($(curl -s http://169.254.169.254/latest/meta-data/instance-type)) ====="
+          dnf install -y python3-pip >/dev/null 2>&1 || true
+
+          measure() { # $1=label $2=path/size
+            local label="$1" f="$2"
+            local sz=$(du -m "$f" 2>/dev/null | cut -f1)
+            echo "$label: ${!sz:-0} MB"
+          }
+
+          echo "----- [1] pip download (pythonhosted, torch) -----"
+          mkdir -p /tmp/pipdl
+          S=$(date +%s)
+          pip3 download --no-deps --no-cache-dir -d /tmp/pipdl torch 2>&1 | tail -2
+          E=$(date +%s); SZ=$(du -m /tmp/pipdl 2>/dev/null | tail -1 | cut -f1)
+          echo "RESULT pip-torch: ${!SZ:-0} MB in $((E-S)) s => $(awk "BEGIN{d=$E-$S; if(d>0) printf \"%.1f\", ${!SZ:-0}/d; else print 0}") MB/s"
+
+          echo "----- [2] HuggingFace LFS-CDN download (bert safetensors ~440MB) -----"
+          S=$(date +%s)
+          curl -sSL -o /tmp/hf.bin "https://huggingface.co/google-bert/bert-base-uncased/resolve/main/model.safetensors" -w "http=%{http_code} dns=%{time_namelookup}s ttfb=%{time_starttransfer}s\n"
+          E=$(date +%s); SZ=$(du -m /tmp/hf.bin 2>/dev/null | cut -f1)
+          echo "RESULT hf-bert: ${!SZ:-0} MB in $((E-S)) s => $(awk "BEGIN{d=$E-$S; if(d>0) printf \"%.1f\", ${!SZ:-0}/d; else print 0}") MB/s (HF LFS-CDN redirect 동작 확인 겸용)"
+
+          echo "----- [3] generic large file (cloudfront, DCV tarball ~100MB+) -----"
+          S=$(date +%s)
+          curl -sSL -o /tmp/dcv.tgz "https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-ubuntu2204-x86_64.tgz" -w "http=%{http_code}\n"
+          E=$(date +%s); SZ=$(du -m /tmp/dcv.tgz 2>/dev/null | cut -f1)
+          echo "RESULT dcv-cloudfront: ${!SZ:-0} MB in $((E-S)) s => $(awk "BEGIN{d=$E-$S; if(d>0) printf \"%.1f\", ${!SZ:-0}/d; else print 0}") MB/s"
+
+          echo "===== END $(date -u) ====="
+          IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          aws s3 cp "$REPORT" "s3://${ReportBucket}/throughput-probe/$IID.log" --region ${AWS::Region} && echo "UPLOAD OK $IID" || echo "UPLOAD FAILED"
+
+Outputs:
+  InstanceId: { Value: !Ref ProbeInstance }
