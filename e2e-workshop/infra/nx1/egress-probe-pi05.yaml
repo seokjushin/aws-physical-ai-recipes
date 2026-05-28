@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NX1 Egress Probe (Spike B — π0.5 GCS reachability) — 5/25 egress-probe.yaml의
+  GCS 확장판. openpi 사전학습 weight가 호스팅된 storage.googleapis.com이 NX1 VPC
+  (Cloud One egress)에서 도달 가능한지 + TLS MITM 흔적 + 다운로드 대역폭을 실측.
+  결과 회수: /var/log/egress-probe-pi05.log + dibh/egress-probe-pi05/<iid>.log.
+  Spike Plan v0.1 §1 Spike B 산출물.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0ba18fea83615b131
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0824e676b789f5f5d
+    Description: SubnetAppA (private, NAT egress, us-east-1a)
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  ReportBucket:
+    Type: String
+    Default: dibh-737138011740-us-east-1-cloudformation
+  IdleMinutes:
+    Type: Number
+    Default: 60
+    Description: probe 끝나면 stop. 60분 후 무활동 자가-stop 안전망.
+
+Resources:
+  ProbeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NX1 pi05 egress probe - egress only, no inbound (Firewall Manager safe)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: all egress via shared NAT to Cloud One
+      Tags:
+        - Key: Name
+          Value: nx1-egress-probe-pi05-sg
+
+  ProbeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReportUploadAndSelfStop
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReportUpload
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${ReportBucket}/egress-probe-pi05/*
+              # F13: SSM 세션 KMS (계정 강제). 인스턴스 역할에 없으면 SSM 핸드셰이크 실패.
+              - Sid: SsmSessionKms
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey]
+                Resource: arn:aws:kms:us-east-1:737138011740:key/c52d7d43-b0f7-401a-981e-51976e09483a
+              # F15: SSM 세션 S3 로그 (계정 강제, prefix sessions/).
+              - Sid: SsmSessionLogsBucket
+                Effect: Allow
+                Action: s3:GetEncryptionConfiguration
+                Resource: arn:aws:s3:::db-bestnx1-us-east-1-sessionmanager-logs
+              - Sid: SsmSessionLogsPut
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::db-bestnx1-us-east-1-sessionmanager-logs/sessions/*
+              - Sid: SelfStop
+                Effect: Allow
+                Action: ec2:StopInstances
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    'ec2:ResourceTag/aws:cloudformation:stack-name': !Ref 'AWS::StackName'
+      Tags:
+        - Key: Name
+          Value: nx1-egress-probe-pi05-role
+
+  ProbeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ProbeRole]
+
+  ProbeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref ProbeSecurityGroup]
+      IamInstanceProfile: !Ref ProbeInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: nx1-egress-probe-pi05
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          REPORT=/var/log/egress-probe-pi05.log
+          exec > >(tee "$REPORT") 2>&1
+          echo "===== NX1 PI05 EGRESS PROBE START $(date -u) ====="
+          IID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null)
+          echo "instance: $IID"
+          echo "region:   ${AWS::Region}"
+          echo
+
+          echo "----- 1) HTTPS REACHABILITY (curl, max-time 20) -----"
+          # 첫 줄: 4종 핵심 = GCS 도메인. 나머지: control samples (이미 통과 확인된 것들 = baseline)
+          HOSTS=(
+            "https://storage.googleapis.com/"
+            "https://storage.googleapis.com/openpi-assets/"
+            "https://storage.googleapis.com/openpi-assets/checkpoints/"
+            "https://www.googleapis.com/"
+            # === control set (5/25 probe로 PASS 확정 = MITM 검출 baseline) ===
+            "https://huggingface.co"
+            "https://nvcr.io/v2/"
+            "https://github.com"
+          )
+          for url in "${!HOSTS[@]}"; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 20 "$url" 2>/tmp/curlerr)
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              printf "%-65s FAIL(curl rc=%s) %s\n" "$url" "$rc" "$(head -c 120 /tmp/curlerr | tr '\n' ' ')"
+            else
+              printf "%-65s HTTP %s\n" "$url" "$code"
+            fi
+          done
+
+          echo
+          echo "----- 2) GCS HEAD on actual openpi pi05_base path -----"
+          # pi05_base 디렉토리 listing (GCS는 directory 개념 없으나 HEAD는 객체 단위)
+          # 실제 객체 path는 openpi에서 알려진 layout: checkpoints/pi05_base/params/_METADATA
+          for path in \
+            "https://storage.googleapis.com/openpi-assets/checkpoints/pi05_base/" \
+            "https://storage.googleapis.com/openpi-assets/checkpoints/pi05_base/_METADATA" \
+            "https://storage.googleapis.com/storage/v1/b/openpi-assets/o?prefix=checkpoints/pi05_base/&maxResults=5" ; do
+            echo
+            echo ">>> HEAD $path"
+            curl -sS -I --max-time 30 "$path" | head -20 || echo "(HEAD failed)"
+          done
+
+          echo
+          echo "----- 3) TLS CERT ISSUER (MITM/Cloud One inspection 탐지) -----"
+          # Google Trust Services 발급원이 그대로 보이면 PASS, Trend Micro/Cloud One 흔적이면 MITM
+          TLS_HOSTS=( "storage.googleapis.com" "www.googleapis.com" "huggingface.co" "github.com" )
+          for h in "${!TLS_HOSTS[@]}"; do
+            cert_info=$(echo | timeout 20 openssl s_client -connect "$h:443" -servername "$h" 2>/dev/null \
+              | openssl x509 -noout -issuer -subject -fingerprint -sha256 2>/dev/null)
+            if [ -n "$cert_info" ]; then
+              echo
+              echo ">>> $h"
+              echo "$cert_info"
+            else
+              echo
+              echo ">>> $h  UNREACHABLE/NO-CERT"
+            fi
+          done
+
+          echo
+          echo "----- 4) RANGE GET (다운로드 가능 + 대역폭 추정) -----"
+          # 인증된 객체가 아닐 가능성 — public openpi-assets는 anonymous read 가정.
+          # 1MB range 다운로드 시간으로 대역폭 추정.
+          RANGE_URL="https://storage.googleapis.com/openpi-assets/checkpoints/pi05_base/_METADATA"
+          echo "URL: $RANGE_URL (Range: bytes=0-1048575)"
+          curl -sS -o /tmp/range.bin -w "http_code=%{http_code} size=%{size_download} time=%{time_total}s speed=%{speed_download}B/s\n" \
+            -H "Range: bytes=0-1048575" --max-time 60 "$RANGE_URL"
+          ls -la /tmp/range.bin 2>/dev/null
+          file /tmp/range.bin 2>/dev/null
+
+          echo
+          echo "----- 5) DNS resolution -----"
+          for h in storage.googleapis.com www.googleapis.com; do
+            echo
+            echo ">>> $h"
+            getent hosts "$h" || echo "(DNS fail)"
+          done
+
+          echo
+          echo "===== NX1 PI05 EGRESS PROBE END $(date -u) ====="
+
+          aws s3 cp "$REPORT" "s3://${ReportBucket}/egress-probe-pi05/$IID.log" --region ${AWS::Region} \
+            && echo "S3 UPLOAD OK -> s3://${ReportBucket}/egress-probe-pi05/$IID.log" \
+            || echo "S3 UPLOAD FAILED (s3 egress 차단 가능)"
+
+Outputs:
+  InstanceId:
+    Value: !Ref ProbeInstance
+  ReportS3Prefix:
+    Value: !Sub s3://${ReportBucket}/egress-probe-pi05/
+  CheckSsmCmd:
+    Value: !Sub aws ssm describe-instance-information --filters Key=InstanceIds,Values=${ProbeInstance} --region ${AWS::Region} --profile BESTNX1-Developer-737138011740
+  StartSession:
+    Value: !Sub aws ssm start-session --target ${ProbeInstance} --region ${AWS::Region} --profile BESTNX1-Developer-737138011740
+  TailReport:
+    Value: !Sub aws s3 cp s3://${ReportBucket}/egress-probe-pi05/${ProbeInstance}.log - --profile BESTNX1-Developer-737138011740
