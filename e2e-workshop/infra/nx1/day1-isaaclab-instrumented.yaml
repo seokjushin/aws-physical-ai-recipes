@@ -182,6 +182,17 @@ Resources:
                 Effect: Allow
                 Action: [kms:Decrypt, kms:GenerateDataKey]
                 Resource: arn:aws:kms:us-east-1:737138011740:key/c52d7d43-b0f7-401a-981e-51976e09483a
+              # 계정 SSM Preferences가 S3 로그 + SSE-KMS 강제(`db-bestnx1-us-east-1-sessionmanager-logs`,
+              # prefix `sessions/`). 버킷 SSE 설정 read + 로그 PUT 권한 없으면 세션 시작 실패
+              # (AccessDenied: s3:GetEncryptionConfiguration).
+              - Sid: SsmSessionLogsBucket
+                Effect: Allow
+                Action: s3:GetEncryptionConfiguration
+                Resource: arn:aws:s3:::db-bestnx1-us-east-1-sessionmanager-logs
+              - Sid: SsmSessionLogsPut
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: arn:aws:s3:::db-bestnx1-us-east-1-sessionmanager-logs/sessions/*
               # idle 자가 stop (자기 스택 인스턴스 한정 - A.5)
               - Sid: SelfStop
                 Effect: Allow
