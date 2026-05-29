@@ -10,37 +10,35 @@ Parameters:
   UserId:
     Type: String
     AllowedPattern: '^[a-z0-9-]+$'
-    Description: 소문자/숫자/하이픈만 (스택명·ECR repo·Name 태그에 사용). 어기면 ECR push silently 실패.
+    Description: Your participant ID. Lowercase / digits / hyphen only (used as stack name suffix, ECR repo, Name tag). Other characters cause silent ECR push failure.
   InstanceType:
     Type: String
     Default: g6.4xlarge
     AllowedValues: [g6.4xlarge, g6e.4xlarge]
-    Description: 기본 g6.4xlarge (5/14 가용 확인). capacity 부족 시 g6e.4xlarge 또는 SubnetId 변경.
+    Description: Default g6.4xlarge (L4 24GB) is sufficient for the workshop. Switch to g6e.4xlarge (L40S 48GB) only if g6 capacity is unavailable.
   VpcId:
     Type: AWS::EC2::VPC::Id
     Default: vpc-0ba18fea83615b131
-    Description: 공유 VPC (Networking 계정 소유)
+    Description: Shared NX1 VPC (Networking account owned). Keep default.
   SubnetId:
     Type: AWS::EC2::Subnet::Id
     Default: subnet-0824e676b789f5f5d
-    Description: SubnetAppA(1a, private). capacity 실패 시 subnet-09db5ca35015f76e3(AppB,1b)로 변경(F6)
+    Description: Private SubnetAppA (1a). If capacity is exhausted, switch to subnet-09db5ca35015f76e3 (AppB, 1b) and redeploy.
   AmiId:
     Type: String
     Default: ami-0aee7b90d684e107d
-    Description: DLAMI Ubuntu 22.04 PyTorch 2.4.1 (us-east-1, stable 프로필). 24.04는 ami-0aad28499825d76c3.
+    Description: Deep Learning AMI Ubuntu 22.04 + PyTorch 2.4.1 (us-east-1). Keep default.
   ScriptsZipUrl:
     Type: String
-    Description: >
-      UserData/idle/prepatch 스크립트 + workshop/ 에셋 zip의 S3 URL
-      (s3://dibh-737138011740-us-east-1-cloudformation/nx1/day1/userdata-<ver>.zip). build-and-stage.sh가 생성.
+    Description: S3 URL of the UserData scripts zip provided by the instructor (e.g. s3://<bucket>/nx1/day1/userdata-<ver>.zip).
   KmsKeyArn:
     Type: String
     Default: ''
-    Description: EBS/EFS 암호화용 CMK ARN (예 db-best-nx1-core-settings-KmsDataKey). 비우면 AWS 관리형 키(F11 회피).
+    Description: Optional CMK ARN for EBS/EFS encryption. Leave blank to use AWS-managed keys. Default is fine for the workshop.
   IdleMinutes:
     Type: Number
     Default: 720
-    Description: 무활동 자가 stop 임계(분, 기본 12h). 멤버 재시작 불가 → runbook "한 번에 완료" 경고. 워크샵일 충분, 방치 시 12h 후 정지.
+    Description: Idle auto-stop threshold in minutes (default 12h). The instance will stop automatically after this idle period and you cannot restart it (instructor-only) - finish the workshop in one sitting.
   NvidiaDriverVersion:
     Type: String
     Default: '570'
@@ -57,7 +55,7 @@ Parameters:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
-    Description: code-server(VSCode) 설치 여부. 8888 바인딩 → SSM 포트포워딩으로 접근(CloudFront 아님).
+    Description: Install code-server (browser VSCode) on port 8888. Access via SSM port forwarding to localhost:8888 (no CloudFront on NX1).
 
 Conditions:
   UseCustomKms: !Not [!Equals [!Ref KmsKeyArn, '']]
