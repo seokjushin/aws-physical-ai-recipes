@@ -11,26 +11,30 @@ Parameters:
     Type: String
     Default: nx1/groot-sm-training
     AllowedPattern: '^nx1/.+'
-    Description: nx1/* 네이밍 필수 (BESTNX1-Deploy ECR 권한 스코프)
+    Description: ECR repo name. Must start with nx1/ (NX1 IAM scope only allows nx1/* prefix).
   InferenceRepoName:
     Type: String
     Default: nx1/groot-sm-inference
     AllowedPattern: '^nx1/.+'
+    Description: Inference ECR repo name. Must start with nx1/.
   GrootVersion:
     Type: String
     Default: n1.6
+    Description: GR00T model version label (used in image tags).
   BaseModelPath:
     Type: String
     Default: nvidia/GR00T-N1.6-3B
+    Description: HuggingFace base model path used by the training container.
   CreateMlflow:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
-    Description: 공유 MLflow tracking server(SageMaker 관리형, 시간당 과금) 생성 여부.
+    Description: Create the shared MLflow tracking server (SageMaker managed, hourly billed). Set false to suspend cost between workshops.
   MlflowSize:
     Type: String
     Default: Small
     AllowedValues: [Small, Medium, Large]
+    Description: MLflow tracking server size. Small is sufficient for the workshop.
 
 Conditions:
   WantMlflow: !Equals [!Ref CreateMlflow, 'true']

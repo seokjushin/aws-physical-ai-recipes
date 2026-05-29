@@ -11,29 +11,28 @@ Parameters:
   UserId:
     Type: String
     AllowedPattern: '^[a-z0-9-]+$'
-    Description: 참가자 식별자 (소문자/숫자/하이픈). user-profile 이름·버킷·롤에 사용.
+    Description: Your participant ID (lowercase/digits/hyphen). Used as prefix for user-profile, S3 bucket, IAM roles.
   StudioDomainId:
     Type: String
     Default: d-evroaqdzfcor
-    Description: 기존 nx1 Studio 도메인 (신규 생성 안 함)
+    Description: Existing shared nx1 Studio domain. Keep default (no new domain created).
   SsoUserValue:
     Type: String
     Default: ''
-    Description: >
-      SSO 도메인용 IdC 사용자명(예 AD ID). 비우면 SSO 매핑 없이 생성 시도(SSO 도메인에선 실패 가능 - F4).
-      채우면 SingleSignOnUserIdentifier=UserName + 이 값으로 매핑.
+    Description: Your full IdC UserName for SSO mapping (e.g. seokjus@doosan.com or ilhwang.cha@corp.doosan.com). Leave blank to auto-create on first Studio login.
   KmsKeyArn:
     Type: String
     Default: ''
-    Description: S3 SSE-KMS용 CMK ARN(db-best-nx1-core-settings-KmsDataKey). 비우면 SSE-S3(AES256) (F7/F11).
+    Description: Optional CMK ARN for S3 SSE-KMS. Leave blank to use SSE-S3 (AES256). Default is fine for the workshop.
   CreateMlflow:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
-    Description: MLflow tracking server 생성 여부(상시 비용). run_training.py MLflow 로깅 쓸 때만 true.
+    Description: Create per-user MLflow tracking server. Keep 'false' - the workshop uses the shared MLflow from nx1-groot-shared. Setting 'true' incurs duplicate hourly cost.
   TrainingRepoName:
     Type: String
     Default: nx1/groot-sm-training
+    Description: Shared training ECR repo name from nx1-groot-shared. Keep default.
 
 Conditions:
   UseCustomKms: !Not [!Equals [!Ref KmsKeyArn, '']]
