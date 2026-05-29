@@ -183,16 +183,14 @@ Resources:
       LogGroupName: !Sub /aws/sagemaker/groot-sm-${UserId}
       RetentionInDays: 30
 
-  # ---------- [5] Studio user-profile (기존 도메인) ----------
-  StudioUserProfile:
-    Type: AWS::SageMaker::UserProfile
-    Properties:
-      DomainId: !Ref StudioDomainId
-      UserProfileName: !Ref UserId
-      SingleSignOnUserIdentifier: !If [HasSso, 'UserName', !Ref 'AWS::NoValue']
-      SingleSignOnUserValue: !If [HasSso, !Ref SsoUserValue, !Ref 'AWS::NoValue']
-      UserSettings:
-        ExecutionRole: !GetAtt NotebookRole.Arn
+  # ---------- [5] Studio user-profile - SSO 도메인 충돌로 제거 ----------
+  # SSO-enabled Studio domain은 IdC 첫 로그인 시 user-profile을 자동생성하고
+  # 같은 SSO UserName은 unique하게 한 user-profile에만 매핑됨. CFN으로 동일 SSO
+  # UserName에 새 user-profile을 만들려고 하면 'AlreadyExists'.
+  # 워크샵 v1은 Studio JupyterLab space 대신 Day1 EC2 인스턴스에서 boto3로 학습
+  # 잡을 launch하는 흐름으로 우회. SageMakerRole/NotebookRole은 그대로 사용 가능
+  # (학습 잡이 PassRole로 SageMakerRole을 받음). 자동생성 user-profile에 KMS 권한을
+  # 박는 fix는 도메인 default execution role 수정 필요 → Dimitri 영역.
 
   # ---------- [6] (옵션) MLflow tracking server ----------
   MlflowTrackingServer:
@@ -213,8 +211,6 @@ Outputs:
     Value: !GetAtt SageMakerRole.Arn
   NotebookRoleArn:
     Value: !GetAtt NotebookRole.Arn
-  StudioUserProfileName:
-    Value: !Ref UserId
   MlflowArn:
     Condition: WantMlflow
     Value: !GetAtt MlflowTrackingServer.TrackingServerArn
