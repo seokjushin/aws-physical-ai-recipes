@@ -112,6 +112,13 @@ Resources:
                   Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
                   Resource: !Ref KmsKeyArn
                 - !Ref 'AWS::NoValue'
+              # Studio domain enforces EBS encryption with the NX1 'NX1 - Data' KMS key.
+              # Without these perms, creating a new JupyterLab space fails with
+              # 'PermissionError: Unable to create EBS volume ... you don't have permissions to use the KMS key'.
+              - Sid: StudioEbsKms
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey, kms:CreateGrant]
+                Resource: arn:aws:kms:us-east-1:737138011740:key/a33a7909-6442-4007-bd3b-7e690d9f3ee2
 
   # ---------- [3] per-user Notebook 실행롤 (CDK-ism 제거 - B.1) ----------
   NotebookRole:
@@ -161,6 +168,13 @@ Resources:
                 Effect: Allow
                 Action: [sagemaker-mlflow:*, sagemaker:DescribeMlflowTrackingServer, sagemaker:CreatePresignedMlflowTrackingServerUrl, logs:DescribeLogGroups, logs:DescribeLogStreams, logs:GetLogEvents, logs:FilterLogEvents]
                 Resource: '*'
+              # Studio domain enforces EBS encryption with the NX1 'NX1 - Data' KMS key.
+              # Without these perms, creating a new JupyterLab space fails with
+              # 'PermissionError: Unable to create EBS volume ... you don't have permissions to use the KMS key'.
+              - Sid: StudioEbsKms
+                Effect: Allow
+                Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey, kms:CreateGrant]
+                Resource: arn:aws:kms:us-east-1:737138011740:key/a33a7909-6442-4007-bd3b-7e690d9f3ee2
 
   # ---------- [4] CloudWatch Log Group (학습) ----------
   SageMakerLogGroup:
