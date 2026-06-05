@@ -208,6 +208,7 @@ __marimo__/
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # CDK projects use lib/ for source code — unignore them so the Python lib/ rule above doesn't swallow them
 !isaac-lab-workshop/*/lib/
