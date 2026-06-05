@@ -17,6 +17,11 @@ Parameters:
     Default: nx1/groot-sm-inference
     AllowedPattern: '^nx1/.+'
     Description: Inference ECR repo name. Must start with nx1/.
+  EdgeInferenceRepoName:
+    Type: String
+    Default: nx1/groot-edge-inference
+    AllowedPattern: '^nx1/.+'
+    Description: Edge (Greengrass) inference ECR repo name, shared across participants. Day1 box builds + pushes a per-user tag here; the Greengrass TES role pulls it. Must start with nx1/.
   GrootVersion:
     Type: String
     Default: n1.6
@@ -62,6 +67,25 @@ Resources:
       LifecyclePolicy:
         LifecyclePolicyText: |
           {"rules":[{"rulePriority":1,"description":"keep last 5 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}
+
+  # ---------- Edge (Greengrass) inference ECR (nx1/*), shared, per-user tags ----------
+  # Day1 box builds + pushes a per-user tag (e.g. :seokjus); the Greengrass TES role
+  # (day3-greengrass.yaml, scoped to nx1/groot-*) pulls it on the edge device.
+  # Shared single repo so participant stacks never collide on the repo name.
+  EdgeInferenceRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref EdgeInferenceRepoName
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        # Shared repo with PER-USER tags (:<userId>): a count-based "keep last N"
+        # would expire participants' images once N is exceeded. Instead expire only
+        # UNTAGGED images (e.g. a re-pushed tag's orphaned old image) after 7 days,
+        # so every participant's current tagged image persists regardless of count.
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"expire untagged after 7 days","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}}]}
 
   # ---------- 공용 CodeBuild 서비스 롤 (S3는 nx1/dibh 버킷 한정 - B.1) ----------
   CodeBuildRole:
@@ -309,6 +333,12 @@ Outputs:
   InferenceRepoName:
     Value: !Ref InferenceRepoName
     Export: { Name: nx1-groot-shared-InferenceRepoName }
+  EdgeInferenceRepoUri:
+    Value: !GetAtt EdgeInferenceRepo.RepositoryUri
+    Export: { Name: nx1-groot-shared-EdgeInferenceRepoUri }
+  EdgeInferenceRepoName:
+    Value: !Ref EdgeInferenceRepoName
+    Export: { Name: nx1-groot-shared-EdgeInferenceRepoName }
   TrainingBuildProjectName:
     Value: !Ref TrainingBuildProject
   InferenceBuildProjectName:

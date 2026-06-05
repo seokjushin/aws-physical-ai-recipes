@@ -1,38 +1,55 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  NX1 Day3 (DRAFT) - Greengrass v2 엣지 배포의 NX1판 사전 프로비저닝.
-  워크샵 setup-greengrass-workshop-N16.sh 의 런타임 자가프로비전(iot:*/greengrass:*/iam:Create*
-  put-role-policy, --provision true)을 NX1 거버넌스에 맞춰 CFN(CloudFormationDeployer=admin)으로
-  사전 생성하고, 인스턴스 역할엔 스코프드 권한만 부여한다. 이후 엔지니어가 SSM 셸에서
-  Greengrass를 --provision false 로 설치하고 컴포넌트를 배포한다.
-  ⚠️ DRAFT: Greengrass 코어 IoT 정책/디바이스 등록 흐름은 1회 실검증 필요(아래 NOTES).
-  배포: --role-arn CloudFormationDeployer --tags doosan:owner=BEST_NX1 --capabilities CAPABILITY_NAMED_IAM.
+  NX1 Day3 - NX1 pre-provisioning for Greengrass v2 edge deployment.
+  The workshop setup-greengrass-workshop-N16.sh performs runtime self-provisioning
+  (iot:*/greengrass:*/iam:Create* put-role-policy, --provision true), which NX1
+  governance blocks. This template pre-creates the IoT/TES/IAM resources via
+  CloudFormation (CloudFormationDeployer = admin) and grants the instance role only
+  scoped permissions. An engineer then installs Greengrass with --provision false
+  from an SSM shell and deploys the components.
+  NOTE (DRAFT): the Greengrass core IoT policy / device-registration flow needs one
+  live validation (see NOTES inline).
+  Deploy with: --role-arn CloudFormationDeployer --tags doosan:owner=BEST_NX1
+  --capabilities CAPABILITY_NAMED_IAM.
 
 Parameters:
   UserId:
     Type: String
     AllowedPattern: '^[a-z0-9-]+$'
-    Description: 참가자 식별자. thing/group/role/ECR/S3 네이밍에 사용.
+    Description: Participant identifier. Used for thing/group/role/ECR/S3 naming.
   InstanceRoleName:
     Type: String
     Default: ''
     Description: >
-      Greengrass를 설치할 인스턴스(보통 Day1 박스)의 IAM 역할 이름. 예 nx1-isaaclab-<UserId>-role.
-      이 역할에 GreengrassProvision 관리형 정책을 붙인다. **비우면 정책은 생성하되 부착 안 함**
-      (Day1 박스 없이 IoT/TES 자원만 검증 배포 시). 나중에 attach-role-policy 또는 update-stack으로 부착.
+      IAM role name of the instance (usually the Day1 box) where Greengrass is
+      installed, e.g. nx1-isaaclab-<UserId>-role. The GreengrassProvision managed
+      policy is attached to this role. Leave empty to create the policy WITHOUT
+      attaching it (when validating IoT/TES resources without a Day1 box).
+      Attach later via attach-role-policy or update-stack.
   ModelArtifactBucket:
     Type: String
-    Description: 모델/recipe/artifact S3 버킷 (TES 역할 read 스코프). 예 nx1-groot-<UserId>-<acct>.
+    Description: Model/recipe/artifact S3 bucket (TES role read scope), e.g. nx1-groot-<UserId>-<acct>.
     AllowedPattern: '^(nx1|dibh)-.+'
   EcrRepoPrefix:
     Type: String
     Default: nx1/groot
-    Description: 추론 컨테이너 ECR repo prefix (nx1/* 필수).
+    Description: Inference container ECR repo prefix (nx1/* required).
   CredentialDurationSeconds:
     Type: Number
     Default: 3600
     MinValue: 900
     MaxValue: 43200
+  IotDataKmsKeyArn:
+    Type: String
+    AllowedPattern: '^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/.+'
+    Description: >
+      ARN of the NX1 IoT Core data CMK (alias/bestnx1/iot/data). REQUIRED - no default,
+      to avoid hardcoding an account-specific ARN in source. Resolve at deploy time:
+      aws kms describe-key --key-id alias/bestnx1/iot/data --query KeyMetadata.Arn --output text
+      The IoT registry is encrypted with this CMK, so IoT write actions
+      (CreateKeysAndCertificate, AttachThingPrincipal, ...) require kms:Decrypt /
+      GenerateDataKey on it. The key policy allows account-root delegation, so granting
+      it in the instance role is sufficient (no key-policy change needed).
 
 Conditions:
   AttachToInstanceRole: !Not [!Equals [!Ref InstanceRoleName, '']]
@@ -49,12 +66,18 @@ Resources:
     Type: AWS::IoT::ThingGroup
     Properties:
       ThingGroupName: !Sub nx1-groot-${UserId}-group
-  # NOTE: Thing→Group 멤버십은 CFN 네이티브 미지원 → 설치 시
-  #       `aws iot add-thing-to-thing-group`(인스턴스 역할 권한 포함)로 추가하거나,
-  #       deployment 타깃을 Thing ARN으로 직접 지정.
+  # NOTE: Thing-to-Group membership is not supported natively in CFN. Add it at
+  #       install time with `aws iot add-thing-to-thing-group` (instance role has
+  #       the permission), or target the deployment at the Thing ARN directly.
 
-  # ---------- [3] Greengrass core용 IoT 정책 ----------
-  # (admin이 생성 — Developer는 iot:CreatePolicy 불가) GGv2 코어 최소 권한.
+  # ---------- [3] IoT policy for the Greengrass core ----------
+  # (Created by admin - Developer cannot iot:CreatePolicy.) Minimal GGv2 core policy
+  # scoped to this core device's thing name, per the AWS minimal core-device policy:
+  # https://docs.aws.amazon.com/greengrass/v2/developerguide/device-auth.html
+  # NOTE: thing policy variables (iot:Connection.Thing.*) are NOT supported for
+  #       core devices - the docs prescribe a thing-name wildcard instead.
+  # NOTE: if an inference component publishes/subscribes to custom MQTT topics,
+  #       add them here (Stage 2 recipe review). ZMQ:5555 is local and needs nothing.
   CoreIotPolicy:
     Type: AWS::IoT::Policy
     Properties:
@@ -63,24 +86,34 @@ Resources:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
-            Action: [iot:Connect, iot:Publish, iot:Subscribe, iot:Receive]
-            Resource: '*'   # DRAFT: 가능하면 $aws/things/nx1-groot-<UserId>/* 토픽으로 스코프
+            Action: iot:Connect
+            # wildcard suffix: core uses thing-name#N as client id past 50 subscriptions
+            Resource: !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/nx1-groot-${UserId}*
+          - Effect: Allow
+            Action: [iot:Publish, iot:Receive]
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/nx1-groot-${UserId}/greengrass/health/json
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/nx1-groot-${UserId}/greengrassv2/health/json
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/nx1-groot-${UserId}/jobs/*
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/$aws/things/nx1-groot-${UserId}/shadow/*
+          - Effect: Allow
+            Action: iot:Subscribe
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/nx1-groot-${UserId}/jobs/*
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/$aws/things/nx1-groot-${UserId}/shadow/*
+          - Effect: Allow
+            Action: iot:AssumeRoleWithCertificate
+            Resource: !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rolealias/nx1-groot-${UserId}-tes
           - Effect: Allow
             Action:
               - greengrass:GetComponentVersionArtifact
               - greengrass:ResolveComponentCandidates
               - greengrass:GetDeploymentConfiguration
               - greengrass:ListThingGroupsForCoreDevice
-              - greengrass:VerifyClientDeviceIdentity
-              - greengrass:GetConnectivityInfo
-              - greengrass:UpdateConnectivityInfo
-            Resource: '*'
-          - Effect: Allow
-            Action: iot:AssumeRoleWithCertificate
-            Resource: !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rolealias/nx1-groot-${UserId}-tes
+            Resource: '*'   # these GGv2 data-plane actions do not support resource-level scoping
 
   # ---------- [4] per-user Token Exchange Role (TES) ----------
-  # 기존 GreengrassTokenExchangeRole(db-best-nx1-core)를 공유 변경하지 않고 per-user 신규 생성.
+  # New per-user role instead of mutating the shared GreengrassTokenExchangeRole (db-best-nx1-core).
   TesRole:
     Type: AWS::IAM::Role
     Properties:
@@ -102,7 +135,7 @@ Resources:
                 Resource:
                   - !Sub arn:aws:s3:::${ModelArtifactBucket}
                   - !Sub arn:aws:s3:::${ModelArtifactBucket}/*
-              - Sid: EcrPull
+              - Sid: EcrAuth
                 Effect: Allow
                 Action: [ecr:GetAuthorizationToken]
                 Resource: '*'
@@ -122,18 +155,18 @@ Resources:
       RoleArn: !GetAtt TesRole.Arn
       CredentialDurationSeconds: !Ref CredentialDurationSeconds
 
-  # ---------- [5] 인스턴스 역할에 붙일 스코프드 Greengrass 프로비전/배포 권한 ----------
-  # 워크샵 스크립트가 런타임에 put-role-policy로 self-grant 하던 broad IAM 대체.
-  # iam:PutRolePolicy/CreateRole 은 절대 포함 안 함(NX1 self-escalation 금지).
+  # ---------- [5] Scoped Greengrass provision/deploy permissions for the instance role ----------
+  # Replaces the broad IAM the workshop script used to self-grant via put-role-policy.
+  # Never includes iam:PutRolePolicy/CreateRole (NX1 self-escalation is forbidden).
   GreengrassProvisionPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: !Sub nx1-groot-${UserId}-gg-provision
-      Roles: !If [AttachToInstanceRole, [!Ref InstanceRoleName], !Ref 'AWS::NoValue']   # 비우면 미부착
+      Roles: !If [AttachToInstanceRole, [!Ref InstanceRoleName], !Ref 'AWS::NoValue']   # empty = not attached
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-          # 설치(--provision false) 시 cert 키페어 생성 + thing/policy 연결
+          # On install (--provision false): create cert keypair + wire thing/policy
           - Sid: GgInstallCert
             Effect: Allow
             Action:
@@ -144,8 +177,11 @@ Resources:
               - iot:AttachPolicy
               - iot:AddThingToThingGroup
               - iot:DescribeThing
-            Resource: '*'   # CreateKeysAndCertificate/DescribeEndpoint는 resource-level 미지원 → *
-          # 컴포넌트 등록 + 배포 (Developer 신원으론 막힘 → 인스턴스 역할로 실행)
+            Resource: '*'   # CreateKeysAndCertificate/DescribeEndpoint do not support resource-level scoping
+          # Register components + deploy (blocked under the Developer identity, so run via instance role)
+          # NOTE: the IAM service prefix for Greengrass V2 is 'greengrass' (NOT 'greengrassv2'),
+          #       even though the CLI namespace is `aws greengrassv2`. See
+          #       service-authorization/latest/reference/list_awsiotgreengrassv2.html
           - Sid: GgDeploy
             Effect: Allow
             Action:
@@ -153,20 +189,38 @@ Resources:
               - greengrass:DescribeComponent
               - greengrass:ListComponents
               - greengrass:ListComponentVersions
-              - greengrassv2:CreateDeployment
-              - greengrassv2:ListEffectiveDeployments
-              - greengrassv2:ListInstalledComponents
-              - greengrassv2:GetCoreDevice
-              - greengrassv2:GetDeployment
+              - greengrass:CreateDeployment
+              - greengrass:ListDeployments
+              - greengrass:ListEffectiveDeployments
+              - greengrass:ListInstalledComponents
+              - greengrass:ListCoreDevices
+              - greengrass:GetCoreDevice
+              - greengrass:GetDeployment
             Resource: '*'
-          # 컴포넌트 recipe/artifact S3 read (인스턴스가 recipe 업로드/다운로드)
+          # greengrass:CreateDeployment (and Cancel/Delete) require these IoT Jobs
+          # dependent actions per the service-authorization reference for GGv2.
+          # Targeting a thing group also needs iot:DescribeThingGroup (verified live).
+          - Sid: GgDeployIotJobDeps
+            Effect: Allow
+            Action:
+              - iot:DescribeThingGroup
+              - iot:DescribeJob
+              - iot:CreateJob
+              - iot:UpdateJob
+              - iot:CancelJob
+              - iot:DeleteThingShadow
+              - iot:GetThingShadow
+              - iot:UpdateThingShadow
+              - iot:DescribeJobExecution
+            Resource: '*'
+          # Component recipe/artifact S3 read+write (instance uploads/downloads recipes)
           - Sid: GgArtifactS3
             Effect: Allow
             Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
             Resource:
               - !Sub arn:aws:s3:::${ModelArtifactBucket}
               - !Sub arn:aws:s3:::${ModelArtifactBucket}/*
-          # 설치 시 TES 역할을 Greengrass에 전달
+          # Pass the TES role to Greengrass at install time
           - Sid: PassTesRole
             Effect: Allow
             Action: iam:PassRole
@@ -174,6 +228,15 @@ Resources:
             Condition:
               StringEquals:
                 iam:PassedToService: credentials.iot.amazonaws.com
+          # The NX1 IoT registry is encrypted with a customer-managed CMK
+          # (alias/bestnx1/iot/data). IoT write actions above (CreateKeysAndCertificate,
+          # AttachThingPrincipal, AddThingToThingGroup, ...) fail with UnauthorizedException
+          # / "Encryption/Decryption failed with Customer Managed Key" unless the caller can
+          # use that key. The key policy delegates to account root, so granting it here is enough.
+          - Sid: IotDataCmk
+            Effect: Allow
+            Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+            Resource: !Ref IotDataKmsKeyArn
 
 Outputs:
   CoreThingName:
@@ -188,11 +251,10 @@ Outputs:
   IotPolicyName:
     Value: !Ref CoreIotPolicy
   InstallHint:
-    Description: SSM 셸에서 Greengrass 수동 설치(--provision false) 개요
+    Description: How to install Greengrass against these resources (--provision false)
     Value: !Sub >-
-      DATA_EP=$(aws iot describe-endpoint --endpoint-type iot:Data-ATS --query endpointAddress --output text);
-      CRED_EP=$(aws iot describe-endpoint --endpoint-type iot:CredentialProvider --query endpointAddress --output text);
-      then create-keys-and-certificate -> attach-policy nx1-groot-${UserId}-ggcore-policy + attach-thing-principal nx1-groot-${UserId} ->
-      java -Droot=/greengrass/v2 -jar GreengrassInstaller/lib/Greengrass.jar --provision false
-      --thing-name nx1-groot-${UserId} --tes-role-alias-name nx1-groot-${UserId}-tes
-      --data-endpoint $DATA_EP --cred-endpoint $CRED_EP --component-default-user ggc_user:ggc_group --setup-system-service true
+      Run setup-greengrass-nx1.sh ${UserId} on the instance. It creates a device cert,
+      attaches it to thing nx1-groot-${UserId} + policy nx1-groot-${UserId}-ggcore-policy,
+      writes a config.yaml (thingName, iotRoleAlias nx1-groot-${UserId}-tes, data/cred
+      endpoints from aws iot describe-endpoint), and runs the installer with
+      --init-config config.yaml --provision false --setup-system-service true.

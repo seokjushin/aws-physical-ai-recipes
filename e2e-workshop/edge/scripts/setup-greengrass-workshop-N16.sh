@@ -3,6 +3,15 @@
 # setup-greengrass-workshop-N16.sh
 # GR00T N1.6 Pick-Orange 워크숍 — Greengrass 설치 + 컴포넌트 등록
 #
+# ⚠️ DEPRECATED for NX1 (Doosan BEST NX1 / 737138011740).
+#    The N1.6 recipes were re-templated with NX1 placeholders
+#    (ECR_IMAGE_PLACEHOLDER / ECR_REPO_PLACEHOLDER / IMAGE_TAG_PLACEHOLDER /
+#     DATASET_URL_PLACEHOLDER), so this script's hi-space ECR sed no longer
+#    matches. For NX1 use setup-greengrass-nx1.sh (no self-provisioning,
+#    --provision false against day2-shared + day3-greengrass CFN resources).
+#    This original script is kept only for the public hi-space (self-provisioned)
+#    flow and is NOT used in the NX1 workshop.
+#
 # N1.7과 동일 구조, 차이점:
 #   - 모델: hi-space/GR00T-N1.6-3B-Pick-Orange
 #   - Docker: groot-n16-inference-jinseony:latest

@@ -10,7 +10,9 @@ ComponentDependencies:
     DependencyType: HARD
 ComponentConfiguration:
   DefaultConfiguration:
-    ecrImage: "007023064118.dkr.ecr.us-east-1.amazonaws.com/groot-n16-inference-jinseony:latest"
+    # NX1: setup-greengrass-nx1.sh substitutes ECR_IMAGE_PLACEHOLDER with
+    # <acct>.dkr.ecr.<region>.amazonaws.com/nx1/groot-edge-inference:<userId>
+    ecrImage: "ECR_IMAGE_PLACEHOLDER"
     modelPath: "/opt/groot/models/GR00T-N1.6-3B-Pick-Orange"
     embodimentTag: "NEW_EMBODIMENT"
     trtEnginePath: "/opt/groot/trt_n16"

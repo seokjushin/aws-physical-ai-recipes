@@ -6,8 +6,10 @@ ComponentDescription: "GR00T N1.6 Docker 이미지 ECR Pull (이미 있으면 �
 ComponentPublisher: Custom
 ComponentConfiguration:
   DefaultConfiguration:
-    ecrRepo: "007023064118.dkr.ecr.us-east-1.amazonaws.com/groot-n16-inference-jinseony"
-    imageTag: "latest"
+    # NX1: shared edge repo (day2-shared EdgeInferenceRepo), per-user image tag.
+    # setup-greengrass-nx1.sh substitutes the placeholders below at registration time.
+    ecrRepo: "ECR_REPO_PLACEHOLDER"
+    imageTag: "IMAGE_TAG_PLACEHOLDER"
     region: "us-east-1"
 Manifests:
   - Platform:
@@ -24,8 +26,11 @@ Manifests:
           FULL_IMAGE="${ECR_REPO}:${IMAGE_TAG}"
           ACCOUNT_ID=$(echo "$ECR_REPO" | cut -d. -f1)
 
-          if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "groot-n16-inference:${IMAGE_TAG}"; then
-            echo "Docker image already exists, skipping"
+          # NX1: the edge image lives at nx1/groot-edge-inference:<userId>. We check
+          # for the full ECR image locally (it may already exist if the Day1 box that
+          # runs Greengrass is the same box that built/pushed it in setup-greengrass-nx1.sh).
+          if docker images --format '{{.Repository}}:{{.Tag}}' | grep -q "^${FULL_IMAGE}$"; then
+            echo "Docker image already exists locally, skipping pull"
             exit 0
           fi
 
@@ -33,6 +38,7 @@ Manifests:
           aws ecr get-login-password --region "$REGION" | \
             docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
           docker pull "$FULL_IMAGE"
+          # keep a stable local tag for any tooling that greps for groot-n16-inference
           docker tag "$FULL_IMAGE" "groot-n16-inference:${IMAGE_TAG}"
-          echo "=== Pull 완료 ==="
+          echo "=== Pull complete ==="
         Timeout: 3600

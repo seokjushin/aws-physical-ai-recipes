@@ -1,8 +1,8 @@
 ---
 RecipeFormatVersion: "2020-01-25"
 ComponentName: com.workshop.setup
-ComponentVersion: "1.0.0"
-ComponentDescription: "GR00T N1.6 Pick-Orange 모델 다운로드 + TRT 엔진 빌드 (DiT Action Head)"
+ComponentVersion: "1.1.0"
+ComponentDescription: "GR00T N1.6 Pick-Orange 모델 다운로드 + TRT 엔진 빌드 (DiT Action Head). NX1: datasetUrl s3:// 지원"
 ComponentPublisher: Custom
 ComponentDependencies:
   com.workshop.docker-build:
@@ -11,7 +11,9 @@ ComponentDependencies:
 ComponentConfiguration:
   DefaultConfiguration:
     modelUrl: "s3://S3_BUCKET_PLACEHOLDER/workshop/GR00T-N1.6-3B-Pick-Orange.tar.gz"
-    datasetUrl: "https://d3ru2qz80ictoo.cloudfront.net/workshop/leisaac-pick-orange.tar.gz"
+    # NX1: dataset staged into the per-user day2 bucket (Step 2 of setup-greengrass-nx1.sh).
+    # setup-greengrass-nx1.sh substitutes DATASET_URL_PLACEHOLDER with the s3:// URL.
+    datasetUrl: "DATASET_URL_PLACEHOLDER"
     modelDir: "/opt/groot/models"
     modelName: "GR00T-N1.6-3B-Pick-Orange"
     buildTrt: "true"
@@ -67,14 +69,20 @@ Manifests:
                 exit 1
               fi
 
-              # 데이터셋 다운로드 (TRT export에 필요)
+              # 데이터셋 다운로드 (TRT export에 필요) — NX1: datasetUrl이 s3:// 면 aws s3 cp, http면 wget
               LOCAL_DATASET="/opt/groot/datasets/leisaac-pick-orange"
               if [ ! -d "$LOCAL_DATASET" ] || [ $(find "$LOCAL_DATASET" -type f | wc -l) -lt 10 ]; then
-                echo "Downloading dataset from CloudFront..."
                 mkdir -p /opt/groot/datasets
-                wget -q --show-progress -O /tmp/leisaac-pick-orange.tar.gz "$DATASET_URL"
-                tar -xzf /tmp/leisaac-pick-orange.tar.gz -C /opt/groot/datasets/
-                rm -f /tmp/leisaac-pick-orange.tar.gz
+                DS_CACHE="/tmp/leisaac-pick-orange.tar.gz"
+                if echo "$DATASET_URL" | grep -q "^s3://"; then
+                  echo "Downloading dataset from S3: $DATASET_URL"
+                  aws s3 cp "$DATASET_URL" "$DS_CACHE" --region "$AWS_DEFAULT_REGION"
+                else
+                  echo "Downloading dataset from $DATASET_URL"
+                  wget -q --show-progress -O "$DS_CACHE" "$DATASET_URL"
+                fi
+                tar -xzf "$DS_CACHE" -C /opt/groot/datasets/
+                rm -f "$DS_CACHE"
               fi
 
               mkdir -p "$TRT_DIR"
