@@ -238,32 +238,42 @@ def build_pipeline(config: dict, args: argparse.Namespace):
     )
 
     # -----------------------------------------------------------------------
-    # Step 3: Endpoint 자동 배포 (LambdaStep)
+    # Step 3 (선택): Endpoint 자동 배포 (LambdaStep)
     #   기존 endpoint 삭제 → Model/EndpointConfig/Endpoint 생성 atomic 수행
+    #
+    #   --no-endpoint(또는 config에 lambda.deploy_endpoint_arn 없음)이면 이 Step을
+    #   파이프라인에서 제외합니다. 그 경우 학습→Model Registry 등록까지만 자동 진행되고,
+    #   endpoint 배포는 inference/sagemaker/deploy_endpoint.py 로 별도 수행합니다
+    #   (NX1 등 deploy-endpoint Lambda가 없는 환경 — LambdaStep을 쓸 수 없음).
     # -----------------------------------------------------------------------
     lambda_cfg = config.get("lambda", {}) or {}
     deploy_lambda_arn = args.deploy_lambda_arn or lambda_cfg.get("deploy_endpoint_arn", "")
-    if not deploy_lambda_arn:
-        print("오류: endpoint 배포 Lambda ARN 이 필요합니다.")
-        print("  infra/deploy_stack.py 를 다시 실행해 config.yaml의 lambda.deploy_endpoint_arn 을 채우세요.")
-        sys.exit(1)
+    with_endpoint = not args.no_endpoint and bool(deploy_lambda_arn)
 
-    deploy_step = LambdaStep(
-        name="DeployEndpoint",
-        lambda_func=Lambda(
-            function_arn=deploy_lambda_arn,
-            session=sagemaker_session,
-        ),
-        inputs={
-            "endpoint_name": p_endpoint_name,
-            "instance_type": p_endpoint_instance_type,
-            "model_data": training_step.properties.ModelArtifacts.S3ModelArtifacts,
-            "image_uri": inference_image_uri,
-            "role_arn": role_arn,
-            "region": region,
-        },
-        depends_on=[training_step],
-    )
+    steps = [training_step, register_step]
+    if with_endpoint:
+        deploy_step = LambdaStep(
+            name="DeployEndpoint",
+            lambda_func=Lambda(
+                function_arn=deploy_lambda_arn,
+                session=sagemaker_session,
+            ),
+            inputs={
+                "endpoint_name": p_endpoint_name,
+                "instance_type": p_endpoint_instance_type,
+                "model_data": training_step.properties.ModelArtifacts.S3ModelArtifacts,
+                "image_uri": inference_image_uri,
+                "role_arn": role_arn,
+                "region": region,
+            },
+            depends_on=[training_step],
+        )
+        steps.append(deploy_step)
+    elif not args.no_endpoint:
+        # endpoint를 원했지만 Lambda ARN이 없는 경우만 경고 (명시적 --no-endpoint은 조용히 진행)
+        print("경고: lambda.deploy_endpoint_arn 이 없어 DeployEndpoint Step을 제외합니다.")
+        print("  학습→Model Registry 등록까지만 자동 진행됩니다.")
+        print("  endpoint 배포는 학습 완료 후 inference/sagemaker/deploy_endpoint.py 로 수행하세요.")
 
     # -----------------------------------------------------------------------
     # 파이프라인 조립
@@ -281,7 +291,7 @@ def build_pipeline(config: dict, args: argparse.Namespace):
             p_endpoint_name,
             p_endpoint_instance_type,
         ],
-        steps=[training_step, register_step, deploy_step],
+        steps=steps,
         sagemaker_session=sagemaker_session,
     )
 
@@ -361,6 +371,10 @@ def main() -> None:
     parser.add_argument("--deploy-lambda-arn",
                         default=config.get("lambda", {}).get("deploy_endpoint_arn", ""),
                         help="endpoint 배포 LambdaStep 함수 ARN (기본: config.yaml의 lambda.deploy_endpoint_arn)")
+    parser.add_argument("--no-endpoint", action="store_true",
+                        help="DeployEndpoint Step 제외 (학습→Model Registry까지만). "
+                             "deploy-endpoint Lambda가 없는 환경(NX1 등)에서 사용. "
+                             "endpoint는 학습 후 inference/sagemaker/deploy_endpoint.py로 별도 배포")
 
     args = parser.parse_args()
 
@@ -397,14 +411,22 @@ def main() -> None:
         execution = pipeline.start(parameters=start_params)
         infer_cfg = config.get("inference", {}) or {}
         endpoint_name = args.endpoint_name or infer_cfg.get("endpoint_name", "")
+        lambda_cfg = config.get("lambda", {}) or {}
+        with_endpoint = not args.no_endpoint and bool(args.deploy_lambda_arn or lambda_cfg.get("deploy_endpoint_arn", ""))
         print(f"\n파이프라인 실행 시작!")
         print(f"  실행 ARN: {execution.arn}")
         print(f"\n진행 상황 확인:")
         print(f"  AWS 콘솔 → SageMaker → Pipelines → {pipeline.name}")
         print(f"\n파이프라인 완료 후 (~15-20분):")
-        print(f"  · endpoint 가 자동 배포됩니다 (LambdaStep). InService 까지 추가 5-10분 소요.")
-        print(f"  · 상태 확인: aws sagemaker describe-endpoint --endpoint-name {endpoint_name}")
-        print(f"  · 추론 호출: python scripts/invoke_endpoint.py --image-path ./sample/test.png ...")
+        if with_endpoint:
+            print(f"  · endpoint 가 자동 배포됩니다 (LambdaStep). InService 까지 추가 5-10분 소요.")
+            print(f"  · 상태 확인: aws sagemaker describe-endpoint --endpoint-name {endpoint_name}")
+            print(f"  · 추론 호출: python scripts/invoke_endpoint.py --image-path ./sample/test.png ...")
+        else:
+            print(f"  · 학습→Model Registry 등록까지 진행됩니다 (endpoint 자동 배포 없음).")
+            print(f"  · endpoint 배포: python ../inference/sagemaker/deploy_endpoint.py --action deploy")
+            print(f"    (config.yaml의 Model Registry 최신 Approved 모델로 배포 — endpoint: {endpoint_name})")
+            print(f"  · 상태 확인 후 추론: python ../inference/sagemaker/invoke_endpoint.py --image-path ./sample/test.png ...")
 
 
 if __name__ == "__main__":

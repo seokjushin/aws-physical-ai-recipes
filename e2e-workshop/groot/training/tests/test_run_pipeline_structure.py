@@ -10,11 +10,13 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+# run_pipeline.py 는 training/ 이 아니라 groot/pipeline/ 에 있다 (parents[2]/pipeline).
+RUN_PIPELINE = ROOT.parent / "pipeline" / "run_pipeline.py"
 
 
 @pytest.fixture
 def pipeline():
-    spec = importlib.util.spec_from_file_location("rp", ROOT / "pipeline" / "run_pipeline.py")
+    spec = importlib.util.spec_from_file_location("rp", RUN_PIPELINE)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
@@ -60,6 +62,42 @@ def pipeline():
         endpoint_name="test-endpoint",
         endpoint_instance_type="ml.g5.2xlarge",
         deploy_lambda_arn="arn:aws:lambda:us-east-1:111:function:test-deploy",
+        no_endpoint=False,
+    )
+    return mod.build_pipeline(cfg, ns)
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("rp", RUN_PIPELINE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def pipeline_no_endpoint():
+    """--no-endpoint: DeployEndpoint Step이 빠진 2-step 파이프라인 (NX1 경로)."""
+    mod = _load_module()
+    cfg = {
+        "aws": {"bucket_name": "test-bucket", "region": "us-east-1",
+                "role_arn": "arn:aws:iam::111:role/Test", "alias": "test"},
+        "ecr": {"training_uri": "111.dkr.ecr.us-east-1.amazonaws.com/train:latest",
+                "inference_uri": "111.dkr.ecr.us-east-1.amazonaws.com/inf:latest"},
+        "inference": {"endpoint_name": "test-endpoint", "instance_type": "ml.g5.2xlarge",
+                      "model_package_group": "test-group"},
+        "lambda": {"deploy_endpoint_arn": "arn:aws:lambda:us-east-1:111:function:test-deploy"},
+        "training": {"use_spot": False},
+    }
+    ns = argparse.Namespace(
+        embodiment_tag="NEW_EMBODIMENT", dataset_s3_uri="s3://test/data",
+        bucket="test-bucket", region="us-east-1", role_arn="arn:aws:iam::111:role/Test",
+        training_image_uri=cfg["ecr"]["training_uri"], inference_image_uri=cfg["ecr"]["inference_uri"],
+        instance_type=None, max_steps=None, global_batch_size=None, num_gpus=None,
+        hf_dataset_id="", hf_token="", groot_version=None, use_spot=False,
+        upsert_only=True, start_only=False, endpoint_name="test-endpoint",
+        endpoint_instance_type="ml.g5.2xlarge",
+        deploy_lambda_arn="arn:aws:lambda:us-east-1:111:function:test-deploy",
+        no_endpoint=True,
     )
     return mod.build_pipeline(cfg, ns)
 
@@ -67,6 +105,13 @@ def pipeline():
 def test_pipeline_has_three_steps(pipeline):
     names = [s.name for s in pipeline.steps]
     assert names == ["GR00TFinetune", "RegisterModel", "DeployEndpoint"]
+
+
+def test_no_endpoint_drops_deploy_step(pipeline_no_endpoint):
+    """--no-endpoint 이면 DeployEndpoint가 빠지고 학습→등록 2-step만 남는다 (NX1)."""
+    names = [s.name for s in pipeline_no_endpoint.steps]
+    assert names == ["GR00TFinetune", "RegisterModel"]
+    assert "DeployEndpoint" not in names
 
 
 def test_pipeline_parameters_include_endpoint_overrides(pipeline):
